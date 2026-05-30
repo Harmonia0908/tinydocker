@@ -1,0 +1,11 @@
+tinydocker
+a.out
+*.o
+*.log
+*.tmp
+.DS_Store
+results/
+runtime/
+*_test_output.txt
+docs/project_interview_notes.md
+iplist.txt
