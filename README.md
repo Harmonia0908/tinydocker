@@ -1,226 +1,179 @@
 # tinydocker
 
-基于 `xanarry/tinydocker` 的 C 语言轻量级容器运行时二次开发分支。原项目用于学习 Docker/容器运行时的核心机制，支持 namespace、cgroup v2、overlayfs、卷挂载、桥接网络、端口映射以及 `run/ps/stop/rm/exec/top/commit` 等基础命令。
+`tinydocker` 是一个基于 `xanarry/tinydocker` 的 C 语言轻量级容器运行时二次开发分支。项目用于学习 Docker/容器运行时的核心机制：Linux namespace、cgroup v2、OverlayFS、`pivot_root`、卷挂载、bridge/veth 网络、iptables 端口映射以及容器 metadata 管理。
 
-本分支重点补充容器可观测性、无 daemon 场景下的状态修正，以及 metadata/命令解析/失败路径的健壮性加固。它仍然是教学型轻量容器运行时，不是生产级 Docker、containerd 或 runc。
+这个项目仍然是教学型系统编程项目，不是生产级 Docker、containerd 或 runc。它不兼容 OCI runtime spec，没有 daemon，没有镜像仓库能力，也没有完整的安全沙箱。
 
+## 已实现功能
 
+当前代码实际支持以下命令和能力：
 
-### 文件说明
+| 功能 | 命令/参数 | 代码位置 | 说明 |
+|---|---|---|---|
+| 启动容器 | `run` | `docker/container.c` | 创建 workspace、cgroup、namespace、网络和 metadata 后执行用户命令。 |
+| 前台/后台运行 | `-i`、`-d` | `cmdparser/cmdparser.c` | `-i` 和 `-d` 互斥。后台容器输出会重定向到 runtime logs。 |
+| 容器命名 | `-n <name>` | `cmdparser/cmdparser.c` | 未指定时使用当前时间戳。名称只允许字母、数字、`.`、`_`、`-`。 |
+| CPU 限制 | `-c <quota>` | `docker/cgroup.c` | 写入 cgroup v2 `cpu.max`，格式为 `<quota> 100000`，代码要求 quota 不小于 1000。 |
+| 内存限制 | `-m <bytes>` | `docker/cgroup.c` | 写入 cgroup v2 `memory.max`，单位是 bytes。 |
+| 环境变量 | `-e KEY=VALUE` | `cmdparser/cmdparser.c`、`docker/container.c` | `run` 和 `exec` 都支持传入用户环境变量。 |
+| 卷挂载 | `-v host:container[:ro\|rw]` | `docker/volumes.c` | 使用 bind mount；默认读写，`ro` 会 remount 为只读。 |
+| 端口映射 | `-p host_port:container_port` | `docker/network.c` | 通过 iptables DNAT 添加 OUTPUT 和 PREROUTING 规则。 |
+| 容器列表 | `ps`、`ps -a` | `docker/container.c`、`docker/status_info.c` | 遍历 `container_info` metadata；查询时会做 lazy status refresh。 |
+| 容器详情 | `inspect <name>` | `docker/container.c` | 输出 metadata、IP、卷和 cgroup 路径。端口映射当前未持久化，显示 `unavailable`。 |
+| 资源快照 | `stats <name>` | `docker/container.c` | 读取 cgroup v2 的 CPU、内存、pids 指标。是单次快照，不是持续监控。 |
+| 进程列表 | `top <name>` | `docker/container.c` | 读取 `cgroup.procs` 后调用宿主机 `ps -f -p ...`。 |
+| 进入容器 | `exec <name> <cmd>` | `docker/container.c` | 使用 `setns` 加入容器 namespace，再 fork/exec 用户命令。 |
+| 停止容器 | `stop [-t seconds] <name...>` | `docker/container.c` | 对 cgroup 中进程先发 SIGTERM，等待后发 SIGKILL，并更新状态。 |
+| 删除容器 | `rm <name...>` | `docker/container.c` | 只删除非 RUNNING 容器，清理 cgroup、mount、workspace、IP、iptables 和 metadata。 |
+| 导出快照 | `commit <name> [tar_path]` | `docker/container.c`、`util/utils.c` | 将容器当前 mountpoint 打包为 tar。 |
+| 网络管理 | `network create/ls/rm` | `docker/network.c` | 使用 Linux bridge，网络信息记录在 runtime networks 文件。 |
 
-```bash
-./
-├── busybox.tar.xz # 容器运行目录
-├── cmdparser # 命令行解析
-│   ├── cmdparser.c
-│   └── cmdparser.h
-├── docker # docker实现代码
-│   ├── cgroup.c # cgroup v2支持
-│   ├── cgroup.h
-│   ├── container.c # 容器核心代码
-│   ├── container.h
-│   ├── network.c #容器网络支持
-│   ├── network.h
-│   ├── status_info.c #容器状态信息记录
-│   ├── status_info.h
-│   ├── volumes.c # 容器卷挂载支持
-│   ├── volumes.h
-│   ├── workspace.c # 容器工作目录管理
-│   └── workspace.h
-├── logger 日志库, 这个引用的https://github.com/rxi/log.c
-│   ├── log.c
-│   └── log.h
-├── main.c # 命令行入口
-├── makefile
-├── README.md
-├── test.c # 临时测试使用的代码
-└── util  # 一些工具函数
-    ├── utils.c
-    └── utils.h
-```
+## 工作原理概览
 
-
-
-### 版本特性支持与变化
-
-| git tags | 说明                                                         |
-| -------- | ------------------------------------------------------------ |
-| v1.0     | Version 1.0, 开启基本的命名空间隔开与容器命令执行            |
-| v2.0     | Version 2.0, 添加对容器的cgroup资源限制, 支持cgroup v2, 可以限制cpu和内存 |
-| v3.0     | Version 3.0, 支持容器新的设置根目录, 设置方式是将镜像地址填成一个本地目录 |
-| v4.0     | Version 4.0, 支持容器overlayfs, 容器里面的变更不再影响挂载的根目录, 支持tar包作为镜像地址(即运行根目录) |
-| v5.0     | Version 5.0, 支持卷挂载(支持挂载多个卷, 支持为卷设置只读<br>测试命令: `sudo ./tinydocker run -i -t  -v /host_dir:container_rwdir -v host_dir:container_rodir:ro busybox.tar.xz /bin/sh` |
-| v6.0     | Version 6.0, 支持docker commit, 将容器当前工作状态打包到tar文件 |
-| v7.0     | Version 7.0, 支持docker ps, 列出运行容器或者全部容器(参数-a) |
-| v8.0     | Version 8.0, 支持docker top, 列出容器中的全部进程            |
-| v9.0     | Version 9.0, 支持docker exec, 添加进程到容器中运行           |
-| v10.0    | Version 10.0, 支持docker stop以及docke rm, 运行前检查容器名是否存在 |
-| v11.0    | Version 11.0, docker run, exec支持传入用户环境变量           |
-| v12.0    | Version 12.0, 支持容器后台运行以及日志文件输出, tinydocker没有守护进程, 如果后台进程运行完退回了, 状态无法设置到EXITED |
-| v13.0    | Version 13.0, 支持桥接网络, 支持命令docker network create    |
-| v14.0    | Version 14.0, 支持端口映射                                   |
-
-
-
-### 二次开发：容器可观测性与 metadata 健壮性增强
-
-本分支基于原版 `xanarry/tinydocker` 做了一轮二次开发，重点增强容器查询、运行时资源观测，以及 metadata 读写链路的健壮性。改造目标不是把 tinydocker 做成生产级 Docker，而是在保留教学项目结构的基础上，让容器状态更容易观察、调试和维护。
-
-#### 新增 inspect 命令
-
-新增命令：
-
-```bash
-sudo ./tinydocker inspect <container_name>
-```
-
-`inspect` 会读取已有的 `container_info` metadata，并输出容器基础信息，包括：
-
-- container name
-- pid
-- status
-- image
-- command
-- created time
-- ip address
-- volume mounts
-- cgroup path
-
-端口映射信息由于原 metadata 暂未持久化，目前显示为 `unavailable`，后续可以通过扩展 metadata 写入链路补齐。当容器不存在、metadata 缺失或部分字段损坏时，命令会给出明确错误或降级输出，避免因为单个字段异常导致查询崩溃。
-
-#### 新增 stats 命令
-
-新增命令：
-
-```bash
-sudo ./tinydocker stats <container_name>
-```
-
-`stats` 基于 cgroup v2 文件系统读取容器运行时资源快照，目前支持读取：
-
-- `memory.current`
-- `memory.max`
-- `cpu.stat`
-- `cpu.max`
-- `pids.current`
-- `pids.max`
-
-输出采用表格形式，便于快速查看容器的 CPU、内存和进程数状态。如果某些 cgroup 文件不存在或读取失败，对应字段会显示为 `N/A`。
-
-#### Lazy Status Refresh
-
-tinydocker 没有 daemon，后台容器退出后，metadata 中的 `RUNNING` 状态可能不会被及时更新。
-
-为了解决这个问题，`ps`、`inspect`、`stats` 查询路径中加入了惰性状态刷新逻辑：
-
-1. 如果 metadata 状态不是 `RUNNING`，直接使用原状态；
-2. 如果状态是 `RUNNING`，检查 `/proc/<pid>` 是否存在；
-3. 如果 `/proc/<pid>` 不存在，则将状态更新为 `EXITED`；
-4. 如果状态写回失败，只输出 warning，不让查询命令崩溃。
-
-这个机制适合当前无 daemon 的轻量实现，可以在不引入后台进程的前提下改善容器状态的一致性。
-
-#### Metadata 健壮性增强
-
-本次改造对 metadata 构造、写入、读取和遍历路径做了安全性加固：
-
-- `create_container_info()` 中避免使用不安全的 `sprintf`、`strcpy`、`strcat`；
-- 对 container name、image、command、created time、status、ip、volume path 等字段做边界检查；
-- command 拼接时检查剩余缓冲区，过长字段直接失败，避免生成损坏 metadata；
-- `write_container_info()` 改为使用 `FILE *` 和 `fprintf()` 增量写入，不再依赖固定大小的聚合缓冲区；
-- `read_container_info()` 对 malformed metadata 做降级处理，包括 NULL 检查、数字字段校验、字符串 bounded copy；
-- metadata 解析只按第一个 `=` 切分，避免 `command=/bin/sh -c "echo A=B"` 这类 value 被截断；
-- volume 数组写入增加边界检查，超出容量的 volume 会被忽略并输出 warning；
-- `list_containers_info()` 增加 capacity 参数，避免 metadata 文件过多时写爆调用方缓冲区。
-
-这些改动保持了原 metadata 文件格式兼容，不影响已有命令对 metadata 的读取方式。
-
-#### 命令解析与 cgroup 写入加固
-
-本次改造还补充了命令解析和 cgroup 写入路径上的低风险修复：
-
-- 修复 `network create` 命令解析分发错误，确保它进入 `create_network()`，而不是误走 `network ls`；
-- 修复 `parse_volume_config()` 中 host/container path 写入定长数组时的溢出风险，过长参数会 fail fast；
-- 为 `run` 命令中的 volumes、env、port mappings、container argv 增加容量检查，避免参数过多时越界写入；
-- 修复 `set_mem_limit()`、`set_cpu_limit()`、`set_cpuset_limit()` 写 cgroup 文件成功路径未关闭 fd 的问题；
-- 修复网络 metadata 更新路径中的返回值误判，避免 `network rm` 成功后误报 `failed update network info`。
-
-#### Run 失败路径清理
-
-`docker_run()` 现在会检查 metadata 构造和写入结果。如果 metadata 创建失败，不再继续启动容器，而是进入 best-effort cleanup 流程：
-
-- kill 并 wait 子进程，避免容器继续运行；
-- 关闭同步 pipe；
-- 尝试清理 cgroup；
-- 尝试清理 network、IP、port mapping；
-- 尝试卸载 volume 和 workspace；
-- 尝试删除部分 metadata 文件；
-- cleanup 失败只输出 warning，不覆盖原始错误。
-
-该清理流程不是严格事务，但可以减少失败启动后遗留的 runtime artifacts。
-
-#### Validation / 验证
-
-当前二次开发主线在 Linux root 环境下通过以下检查：
-
-```bash
-make clean && make
-sudo bash tests/test_observability.sh
-sudo bash tests/test_full_function.sh
-```
-
-验证输出包含：
+`tinydocker run` 的主流程如下：
 
 ```text
+用户输入
+-> main.c: main()
+-> docker/container.c: init_docker_env()
+-> cmdparser/cmdparser.c: parse_docker_cmd()
+-> docker/container.c: docker_run()
+-> docker/workspace.c: init_container_workerspace()
+-> docker/volumes.c: mount_volumes()
+-> docker/cgroup.c: init_cgroup() / set_cgroup_limits()
+-> clone(CLONE_NEWUTS | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWIPC)
+-> docker/cgroup.c: apply_cgroup_limit_to_pid()
+-> docker/network.c: connect_container()
+-> docker/network.c: set_container_port_map()
+-> docker/status_info.c: create_container_info() / write_container_info()
+-> 父进程通过 pipe 通知子进程继续执行
+-> docker/workspace.c: init_and_set_new_root()
+-> execve(container command)
+```
+
+几个关键点：
+
+- 容器本质是宿主机上的进程；隔离来自 namespace，资源限制来自 cgroup。
+- 项目使用 `clone()` 创建带 UTS、PID、Mount、Network、IPC namespace 的子进程，没有启用 user namespace。
+- 父进程创建子进程后先把 child pid 写入 cgroup，再通过 pipe 通知子进程执行用户命令，避免用户命令在资源限制生效前运行。
+- 文件系统使用 OverlayFS：镜像/rootfs 是 lowerdir，每个容器有独立 upperdir、workdir 和 mountpoint。
+- 子进程通过 `pivot_root` 把 mountpoint 切换为容器内 `/`，并重新挂载 `/proc`。
+- 容器网络使用 veth pair，一端接入宿主机 bridge，一端移动到容器 network namespace。
+- 端口映射通过 iptables DNAT 实现；但端口映射没有写入 `container_info`，所以 `inspect` 只能显示 `PortMappings: unavailable`。
+
+## 仓库结构
+
+```text
+.
+├── README.md
+├── makefile
+├── main.c
+├── busybox.tar.xz
+├── docker.md
+├── cmdparser/
+│   ├── cmdparser.c
+│   └── cmdparser.h
+├── docker/
+│   ├── cgroup.c
+│   ├── cgroup.h
+│   ├── container.c
+│   ├── container.h
+│   ├── network.c
+│   ├── network.h
+│   ├── status_info.c
+│   ├── status_info.h
+│   ├── volumes.c
+│   ├── volumes.h
+│   ├── workspace.c
+│   └── workspace.h
+├── util/
+│   ├── utils.c
+│   └── utils.h
+├── logger/
+│   ├── log.c
+│   └── log.h
+├── tests/
+│   ├── test_observability.sh
+│   └── test_full_function.sh
+└── docs/
+    ├── FULL_FUNCTION_TEST.md
+    └── project_interview_notes.md
+```
+
+重要文件说明：
+
+- `main.c`：命令入口，负责初始化环境、解析命令并分发。
+- `cmdparser/`：命令行解析和参数结构体定义。
+- `docker/container.c`：容器生命周期主流程，包括 `run/ps/top/exec/stop/rm/commit/inspect/stats`。
+- `docker/workspace.c`：镜像 rootfs、OverlayFS、`pivot_root` 和 `/proc` 挂载。
+- `docker/cgroup.c`：cgroup v2 目录和文件操作。
+- `docker/network.c`：bridge/veth/IP 分配/iptables 端口映射。
+- `docker/status_info.c`：容器 metadata 读写、状态更新和 lazy status refresh。
+- `docker/volumes.c`：卷 bind mount 和只读 remount。
+- `util/utils.c`：路径、目录、tar、SHA256、时间格式化等工具函数。
+- `logger/`：第三方轻量日志库 `rxi/log.c`。
+- `tests/`：Linux root 环境下的端到端回归脚本。
+- `docs/FULL_FUNCTION_TEST.md`：完整手工和自动测试说明。
+- `docs/project_interview_notes.md`：项目学习与面试复习说明文档。
+- `test.c`：历史临时实验文件，不参与当前构建，且当前内容不是可靠测试。
+- `a.png`、`b.png`、`c.png`、`iplist.txt`：历史资料或实验残留，当前主流程代码不依赖。
+
+## 环境要求
+
+项目依赖 Linux 内核特性和 root 权限。推荐环境：
+
+- Debian 12 或 Ubuntu 22.04
+- root 或 passwordless sudo
+- cgroup v2 mounted at `/sys/fs/cgroup`
+- overlayfs 可用
+- CPU 架构匹配的 rootfs tar 包
+
+依赖软件：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential libssl-dev bridge-utils iproute2 iptables tar curl
+```
+
+检查 cgroup v2 和 overlayfs：
+
+```bash
+stat -fc %T /sys/fs/cgroup
+grep overlay /proc/filesystems
+```
+
+期望：
+
+- `/sys/fs/cgroup` 输出 `cgroup2fs`
+- `/proc/filesystems` 包含 `overlay`
+
+注意：本项目不能在 macOS 上完整编译或运行。代码依赖 `argp.h`、`clone()`、`setns()`、Linux mount flags、cgroup v2、iptables、bridge 等 Linux 专有能力。
+
+## 编译
+
+```bash
+make clean
+make
+```
+
+`makefile` 实际执行：
+
+```bash
 gcc -Wall logger/*.c util/*.c cmdparser/*.c docker/*.c main.c -lcrypto -o tinydocker
-[test-observability] observability test passed
-[test-full] full function test passed
 ```
 
-`tests/test_observability.sh` 会覆盖编译、后台容器启动、`inspect` 输出检查、`stats` 指标检查，以及容器退出后通过 lazy refresh 将状态从 `RUNNING` 修正为 `EXITED` 的路径。
-
-`tests/test_full_function.sh` 会覆盖 `run`、volume、env、cgroup limit、`ps`、`inspect`、`stats`、`top`、`exec`、network create/list/rm、port mapping、lazy refresh、`commit`、`stop`、`rm` 等主功能路径。
-
-完整功能手工回归步骤见：[docs/FULL_FUNCTION_TEST.md](docs/FULL_FUNCTION_TEST.md)。
-
-
-
-### 平台要求与依赖
-
-代码在Ubuntu22.04实现, 依赖overlayfs, libcrypto以及tar和brctl工具
-
-
-
-### 使用方法
-
-#### Quick Demo
-
-项目提供 `demo.sh` 用于一键展示容器生命周期，适合录屏、答辩或面试演示：
+清理：
 
 ```bash
-sudo bash demo.sh
+make clean
 ```
 
-默认使用仓库内的 `busybox.tar.xz` 作为镜像/rootfs。也可以指定其他 busybox/alpine tar 包或 rootfs：
+## Runtime 目录
 
-```bash
-sudo IMAGE=/path/to/alpine-rootfs.tar.xz bash demo.sh
-```
+代码中硬编码 runtime 根目录为 `/home/xanarry/tinydocker_runtime`。如果运行环境没有 `/home/xanarry`，需要先创建，或者修改相关宏定义。
 
-Demo 会依次执行：
+相关宏：
 
-1. 预检 root 权限、cgroup v2、`make/gcc/tar/ip/iptables/brctl` 和镜像/rootfs；
-2. `make` 编译 `tinydocker`；
-3. `run -d` 启动一个 busybox/alpine 容器；
-4. `inspect` 展示容器 metadata；
-5. `stats` 展示 cgroup v2 资源指标；
-6. `stop` 和 `rm` 删除容器；
-7. 检查并清理 demo 容器残留 metadata、cgroup 和 workspace。
-
-脚本只使用默认形如 `td_demo_<pid>` 的 demo 容器名，也可以通过 `NAME=my_demo_container` 覆盖。运行结束后会通过 `trap` 做 best-effort cleanup，避免留下 demo 容器脏数据。
-
-#### 使用说明与下载编译
-tinydocker会在*/home/xanarry/tinydocker_runtime*文件夹下创建运行时需要的目录, 编译前需要先创建*/home/xanarry/*, 或者搜索修改代码中的宏定义
 ```c
 #define TINYDOCKER_RUNTIME_DIR "/home/xanarry/tinydocker_runtime"
 #define CONTAINER_STATUS_INFO_DIR "/home/xanarry/tinydocker_runtime/container_info"
@@ -228,83 +181,215 @@ tinydocker会在*/home/xanarry/tinydocker_runtime*文件夹下创建运行时需
 #define CONTAINER_NETWORKS_FILE "/home/xanarry/tinydocker_runtime/networks"
 ```
 
-容器运行会在`/home/xanarry/`生成如下目录和文件：
-```
-./tinydocker_runtime
-├── container_info  # 记录容器信息，每个容器对应里面的一个文件
-├── containers # 保持容器的挂载信息，比如卷挂载和overlayfs信息
-├── images # 容器镜像，一个镜像的tar的hash对应的一个解压后的目录，同一个hash的目录会被多个容器复用，事实上就是overlay fs的只读层
-├── logs # 容器后台运行输入出的日志文件
-└── networks # 这是一个文件， 记录网络和网络IP地址的分配情况
-```
+运行后目录结构：
 
-下载编译
-```
- git@github.com:xanarry/tinydocker.git # 克隆仓库
- cd tinydocker # 进入仓库目录
- make # 编译名为tinydocker的二进制
+```text
+/home/xanarry/tinydocker_runtime
+├── container_info    # 每个容器一个 metadata 文件
+├── containers        # 容器 upperdir/workdir/mountpoint
+├── images            # tar rootfs 按 SHA256 解压缓存后的只读层
+├── logs              # 后台容器 stdout/stderr
+└── networks          # bridge 网络和已分配 IP 记录
 ```
 
+## 使用示例
 
-#### 参数说明
+启动一个后台容器：
 
-| 参数 | 参数说                                                       |
-| ---- | ------------------------------------------------------------ |
-| -i   | 使用交互模式, 容器在前台运行                                 |
-| -d   | 容器后台运行, 与-i是互斥参数, 不能同时使用                   |
-| -v   | 卷挂载, 可以使用多个-v挂载多个卷, 默认读写挂载: `-v host_a:rwa`, 只读挂载: `-v host_b:rwb:ro` |
-| -c   | 参数值为整数, 不要设置小于1000, 资源太小会导致容器起不来, cpu分配形式为N/100000, -c参数设置的是N值 |
-| -m   | 参数值为整数, 设置内存, 单位是字节（bytes）                  |
-| -e   | 设置容器环境变量. 形式: `-e a=b`                             |
-| -p   | 设置容器端口映射. 可以使用多个-p映射多个端口. 形式: `-p 80=8080`将容器端口8080映射到宿主机80端口 |
-| -n   | 设置容器名字, 如果没有指定, 会使用接受用户命令的时间戳作为容器名 |
+```bash
+sudo ./tinydocker run -d -n demo busybox.tar.xz /bin/sh -c 'sleep 120'
+```
 
+查看容器：
 
+```bash
+sudo ./tinydocker ps
+sudo ./tinydocker ps -a
+sudo ./tinydocker inspect demo
+sudo ./tinydocker stats demo
+sudo ./tinydocker top demo
+```
 
-#### 使用样例
+进入容器执行命令：
 
-`sudo ./tinydocker run -i -v /etc:/ro_dir:ro -v /var:/rw_dir -c 20000 -m 819200 -p 88:8888 -p 99:9999 -e a=aval -e b=bval -n test_container busybox.tar.xz /bin/sh`
+```bash
+sudo ./tinydocker exec demo /bin/sh -c 'echo exec-ok > /tmp/exec-ok'
+```
 
-这个命令使用tinydocker支持的所有特性, 包括卷挂载, 设置容器环境变量, 设置容器CPU/内存资源限制, 设置端口映射, 可以根据实际使用缩减参数
+停止和删除：
 
-样例参数详细说明:
+```bash
+sudo ./tinydocker stop -t 1 demo
+sudo ./tinydocker rm demo
+```
 
-`-i`: 该命令使用交互模式启动了一个容器
+带资源限制、环境变量、卷挂载、端口映射的启动示例：
 
-`-n test_container`: 命令容器名为test_container
+```bash
+sudo ./tinydocker run -d \
+  -n test_container \
+  -c 20000 \
+  -m 134217728 \
+  -e TD_ENV=ok \
+  -v /tmp/td_host_rw:/rw_dir \
+  -v /tmp/td_host_ro:/ro_dir:ro \
+  -p 18080:8080 \
+  busybox.tar.xz /bin/sh -c 'echo "$TD_ENV" > /rw_dir/env.out; sleep 120'
+```
 
-`busybox.tar.xz`: tinydocker将busybox.tar.xz包解压后的内容作为容器运行根目录
+创建和删除网络：
 
-`-v /var:/rw_dir`: 将主机的/var目录读写挂载到容器的/rw_dir目录
+```bash
+sudo ./tinydocker network create td_net 172.18.0.0/24
+sudo ./tinydocker network ls
+sudo ./tinydocker network rm td_net
+```
 
-`-v /etc:/ro_dir:ro`: 将主机的/etc目录只读挂载到容器的/ro_dir目录
+导出容器当前文件系统快照：
 
-`-c20000`: 设置容器的cpu限制为20000/100000
+```bash
+sudo ./tinydocker commit test_container /tmp/test_container.tar
+```
 
-`-m 819200`: 设置容器的内存现在为819200字节
+## 参数说明
 
-`-p 88:8888 -p 99:9999`: 分别将容器的8888端口和9999端口映射到主机的88和99端口
+| 参数 | 说明 |
+|---|---|
+| `-i` | 前台交互模式。 |
+| `-d` | 后台运行；不能和 `-i` 同时使用。 |
+| `-n <name>` | 设置容器名；未设置时使用当前时间戳。 |
+| `-v host:container[:ro\|rw]` | 卷挂载。默认读写，第三段为 `ro` 时只读。 |
+| `-c <quota>` | CPU quota，写入 `cpu.max` 的第一个字段，代码要求不小于 1000。 |
+| `-m <bytes>` | 内存限制，写入 `memory.max`，单位 bytes。 |
+| `-e KEY=VALUE` | 传入环境变量。 |
+| `-p host_port:container_port` | 端口映射。代码实际使用冒号分隔，不是等号。 |
 
-`-e a=aval -e b=bval`: 为容器设置a, b两个环境变量, 值分别为aval, bval
+## inspect 和 stats
 
-`/bin/sh`: 启动容器后运行/bin/sh
+`inspect` 读取 `container_info` metadata，并输出：
 
-运行效果：
-![容器运行](a.png)
+- Name
+- PID
+- Status
+- Image
+- Command
+- Created
+- IP
+- CgroupPath
+- Volumes
+- PortMappings
 
-![参数检查](b.png)
+示例：
 
+```bash
+sudo ./tinydocker inspect demo
+```
 
-### 设计原理与过程
-参考文件：[docker.md](https://github.com/xanarry/tinydocker/blob/main/docker.md)
+端口映射当前没有持久化到 metadata，因此输出固定为：
 
+```text
+PortMappings: unavailable
+```
 
+`stats` 读取 cgroup v2 文件系统中的资源快照：
 
-### 简历表述参考
+- `cpu.stat` 中的 `usage_usec`
+- `memory.current`
+- `memory.max`
+- `cpu.max`
+- `pids.current`
+- `pids.max`
+
+示例：
+
+```bash
+sudo ./tinydocker stats demo
+```
+
+如果某些 cgroup 文件不存在或读取失败，对应字段会显示 `N/A`。
+
+## Lazy Status Refresh
+
+`tinydocker` 没有 daemon。后台容器启动后，父进程直接返回；如果容器后来自己退出，metadata 中的状态可能仍然是 `RUNNING`。
+
+为缓解这个问题，`ps`、`inspect`、`stats` 查询路径会执行 lazy status refresh：
+
+1. 如果 metadata 状态不是 `RUNNING`，直接使用原状态。
+2. 如果状态是 `RUNNING`，检查 `/proc/<pid>` 是否存在。
+3. 如果 `/proc/<pid>` 不存在，把状态写回为 `EXITED`。
+4. 写回失败只输出 warning，不让查询命令崩溃。
+
+这是无 daemon 设计下的折中方案，不是强一致状态管理。它不能完全解决 PID reuse 问题。
+
+## 测试
+
+完整测试需要 Linux root 环境。
+
+可观测性回归：
+
+```bash
+sudo bash tests/test_observability.sh
+```
+
+覆盖内容：
+
+- 编译；
+- 后台短生命周期容器启动；
+- `inspect` 输出检查；
+- `stats` 指标检查；
+- 容器退出后 lazy refresh 将 `RUNNING` 修正为 `EXITED`；
+- `ps -a` 显示退出状态。
+
+全功能回归：
+
+```bash
+sudo bash tests/test_full_function.sh
+```
+
+覆盖内容：
+
+- `run`
+- volume
+- env
+- cgroup limit
+- `ps`
+- `inspect`
+- `stats`
+- `top`
+- `exec`
+- `network create/ls/rm`
+- port mapping
+- lazy refresh
+- `commit`
+- `stop`
+- `rm`
+
+如果仓库内 `busybox.tar.xz` 和 VM 架构不匹配，可能出现 `Exec format error`。ARM64 VM 可参考 `docs/FULL_FUNCTION_TEST.md` 生成架构匹配的 rootfs，并通过 `IMAGE=/path/to/rootfs.tar.xz` 指定。
+
+## 已知边界和风险
+
+- 项目是教学型容器运行时，不是生产级 Docker/containerd/runc。
+- 不支持 OCI runtime spec。
+- 没有 daemon，状态通过 metadata 和 lazy refresh 弱同步。
+- 没有完整镜像仓库、镜像 tag、镜像 manifest 或多 layer metadata。
+- 没有 seccomp、AppArmor/SELinux、capabilities drop、user namespace 等完整安全隔离。
+- 端口映射通过 iptables 生效，但没有持久化到 `container_info`。
+- 网络 metadata 和容器 metadata 没有文件锁，并发执行多个命令可能产生竞争。
+- 代码大量使用 `system()` 调用 `tar`、`ip`、`brctl`、`iptables`、`nsenter`，工程上仍有命令注入和错误处理粒度不足的问题。
+- runtime 路径硬编码为 `/home/xanarry/tinydocker_runtime`。
+- `test.c` 是历史临时实验代码，不参与构建，不应作为测试依据。
+
+## 进一步阅读
+
+- [完整功能测试说明](docs/FULL_FUNCTION_TEST.md)
+- [项目学习与面试复习说明文档](docs/project_interview_notes.md)
+- [容器原理说明](docker.md)
+
+## 简历表述参考
 
 **TinyDocker 二次开发：轻量级容器运行时可观测性与健壮性增强**
 
-- 基于 C 语言教学型容器运行时 tinydocker 进行二次开发，扩展 `inspect` / `stats` 命令，支持容器 metadata、运行状态、挂载信息、IP、cgroup 路径及 cgroup v2 资源指标查询。
-- 实现无 daemon 场景下的 lazy status refresh，在 `ps/inspect/stats` 查询路径中通过 `/proc/<pid>` 检测修正失效 `RUNNING` 状态，缓解后台容器退出后的状态滞后问题。
-- 加固命令解析与 metadata 处理链路：修复 volume 路径固定数组溢出风险，为 volumes/env/ports/container argv 增加容量检查，并支持 value 含 `=` 的 metadata 解析。
-- 优化资源管理与失败路径：修复 cgroup 写入成功路径 fd 泄漏，增强 `docker_run` 失败时对子进程、cgroup、网络、volume、workspace 和 metadata 的 best-effort cleanup。
+- 基于 C 语言教学型容器运行时实现容器生命周期管理，使用 Linux namespace、cgroup v2、OverlayFS、`pivot_root`、veth/bridge/iptables 串联容器启动、资源限制、文件系统隔离和基础网络。
+- 扩展 `inspect` / `stats` 命令，支持查询容器 metadata、运行状态、挂载信息、IP、cgroup 路径及 cgroup v2 资源指标快照。
+- 实现无 daemon 场景下的 lazy status refresh，在 `ps/inspect/stats` 查询路径中通过 `/proc/<pid>` 检测修正失效 `RUNNING` 状态。
+- 加固 metadata 读写、命令解析和失败清理路径，并通过 Shell 端到端测试覆盖主流程、可观测性、网络、端口映射和容器清理。
