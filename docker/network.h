@@ -19,16 +19,16 @@ struct network {
 
 
 int delte_network(char *name);
-int create_default_bridge();
+int create_default_bridge(void);
 int create_network(char *name, char *cidr, char *driver);
 unsigned alloc_new_ip(char *name, char *ip, int buf_size);
 int release_used_ip(char *name, char *ip);
-void list_network();
+void list_network(void);
 void remove_docker_network(struct docker_network_rm *cmd);
 int connect_container(char *container_name, char *network, char *ip_addr);
 int disconnect_container(char *container_name, char *network);
-void set_container_port_map(char *container_ip, int port_cnt, struct port_map *port_maps);
-void unset_container_port_map(char *container_ip);
+int set_container_port_map(char *container_ip, int port_cnt, struct port_map *port_maps);
+int unset_container_port_map(char *container_ip);
 void get_first_cidr_host_ip(char *cidr_network, char *cidr_host_ip, int size);
 
 #endif

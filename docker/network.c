@@ -3,15 +3,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
+#include <net/if.h>
+#include <stdint.h>
 #include "network.h"
 #include "cgroup.h"
 #include "status_info.h"
 #include "../cmdparser/cmdparser.h"
 #include "../logger/log.h"
+#include "../core/process.h"
+#include "../core/safety.h"
 
 
 //IP地址转主机序整数
-unsigned int str_ip_to_int(char *ip) {
+static unsigned int str_ip_to_int(char *ip) {
     struct in_addr addr;
     addr.s_addr = inet_addr(ip);
     inet_aton(ip, &addr);
@@ -19,40 +23,39 @@ unsigned int str_ip_to_int(char *ip) {
 }
 
 //主机序列整数转字符串IP
-void int_to_str_ip(unsigned int int_ip, char *ip_buf, int ip_buf_size) {
+static void int_to_str_ip(unsigned int int_ip, char *ip_buf, int ip_buf_size) {
     struct in_addr addr;
     addr.s_addr = htonl(int_ip);
-    inet_ntop(AF_INET, &addr, ip_buf, ip_buf_size);
+    inet_ntop(AF_INET, &addr, ip_buf, (socklen_t)ip_buf_size);
 }
 
 //获取IP地址的有效范围
-void get_CIDR_range(const char* cidr, unsigned int *minIP, unsigned int *maxIP) {
-    char network[16];
-    int prefix;
-    sscanf(cidr, "%[^/]/%d", network, &prefix);
+static int get_cidr_range(const char *cidr, unsigned int *minimum,
+                          unsigned int *maximum, unsigned int *prefix) {
+    char error[160] = {0};
+    uint32_t network = 0;
+    unsigned int parsed_prefix = 0;
+    uint32_t mask;
 
-    unsigned int ip = str_ip_to_int(network);
-    unsigned int mask = 0xFFFFFFFF << (32 - prefix);
-
-    *minIP = ip & mask; //htonl
-    *maxIP = ip | (~mask);
-}
-
-
-void print_network(struct network *nw) {
-    printf("   name: %s\n", nw->name);
-    printf(" driver: %s\n", nw->driver);
-    printf("   cidr: %s\n", nw->cidr);
-    printf("used_ip: ");
-    for (int i = 0; i < nw->used_ip_cnt; i++) {
-        char str_ip_buf[64] = {0};
-        int_to_str_ip(nw->used_ips[i], str_ip_buf, 64);
-        printf("%s|%u ", str_ip_buf, nw->used_ips[i]);
+    if (minimum == NULL || maximum == NULL ||
+        td_parse_ipv4_cidr(cidr, &network, &parsed_prefix,
+                           error, sizeof(error)) != 0) {
+        log_error("invalid network CIDR %s: %s",
+                  cidr == NULL ? "(null)" : cidr, error);
+        return -1;
     }
-    puts("\n");
+    mask = parsed_prefix == 0U ? UINT32_C(0) :
+        UINT32_MAX << (32U - parsed_prefix);
+    *minimum = network;
+    *maximum = network | ~mask;
+    if (prefix != NULL) {
+        *prefix = parsed_prefix;
+    }
+    return 0;
 }
 
-int write_network_info(struct network nw) {
+
+static int write_network_info(struct network nw) {
     FILE* file = fopen(CONTAINER_NETWORKS_FILE, "a");
     if (file == NULL) {
         log_error("failed to open %s, error: %s", CONTAINER_NETWORKS_FILE, strerror(errno));
@@ -74,7 +77,7 @@ int write_network_info(struct network nw) {
 }  
 
 
-int get_network_list(struct network *nw_buffer, int bufsize) {
+static int get_network_list(struct network *nw_buffer, int bufsize) {
     FILE* file = fopen(CONTAINER_NETWORKS_FILE, "r");
     if (file == NULL) {
         log_error("failed to open %s, error: %s", CONTAINER_NETWORKS_FILE, strerror(errno));
@@ -123,9 +126,9 @@ int get_network_list(struct network *nw_buffer, int bufsize) {
 }
 
 
-int read_network_info(char *name, struct network *nw) {
+static int read_network_info(char *name, struct network *nw) {
     int bufsize = 128;
-    struct network *nw_buffer = malloc(sizeof(struct network) * bufsize);
+    struct network *nw_buffer = malloc(sizeof(struct network) * (size_t)bufsize);
     int size = get_network_list(nw_buffer, bufsize);
     int ok = -1;
     for (int i = 0; i < size; i++) {
@@ -139,9 +142,9 @@ int read_network_info(char *name, struct network *nw) {
 }
 
 
-int delete_network_info(char *name) {
+static int delete_network_info(char *name) {
     int bufsize = 128;
-    struct network *nw_buffer = malloc(sizeof(struct network) * bufsize);
+    struct network *nw_buffer = malloc(sizeof(struct network) * (size_t)bufsize);
     if (nw_buffer == NULL) {
         log_error("failed alloc network buffer");
         return -1;
@@ -173,14 +176,8 @@ int delete_network_info(char *name) {
 }
 
 
-int net_has_exist(char *brname) {
-    char check_cmd[128] = {0};
-    // 检查网桥是不是已经存在
-    sprintf(check_cmd, "brctl show | grep -q '^%s'", brname);
-    if (system(check_cmd) != 0) {
-        return 0;
-    }
-    return 1;
+static int net_has_exist(char *brname) {
+    return if_nametoindex(brname) == 0U ? 0 : 1;
 }
 
 int create_network(char *name, char *cidr_network, char *driver) {
@@ -204,9 +201,8 @@ int create_network(char *name, char *cidr_network, char *driver) {
     };
 
     //创建网桥
-    char bradd_cmd[128] = {0};
-    sprintf(bradd_cmd, "if ! brctl show | grep -q \"^%s\"; then brctl addbr \"%s\"; fi", name, name);
-    if (system(bradd_cmd) != 0) {
+    char *const add_bridge[] = {"brctl", "addbr", name, NULL};
+    if (td_run_command(add_bridge) != 0) {
         log_error("failed create new bridge for %s", name);
         return -1;
     }
@@ -214,31 +210,31 @@ int create_network(char *name, char *cidr_network, char *driver) {
     //写入网络信息
     if (write_network_info(nw) == -1) {
         log_error("failed to save network info: %s", name);
+        char *const delete_bridge[] = {"brctl", "delbr", name, NULL};
+        (void)td_run_command(delete_bridge);
         return -1;
     }
 
     //为网桥设置IP地址
     char firs_cidr_ip[32] = {0};
     get_first_cidr_host_ip(cidr_network, firs_cidr_ip, 32);
-    char set_ip_cmd[128] = {0};
-    sprintf(set_ip_cmd, "ip addr add %s dev %s", firs_cidr_ip, name); //这里使用cidr地址
-
-    char start_up[128] = {0};
-    sprintf(start_up, "ip link set %s up", name);
-
-    char *cmds[] = {set_ip_cmd, start_up, NULL};
-    for (int i = 0; cmds[i] != NULL; i++) {
-        if(system(cmds[i]) != 0) {
-            log_warn("faild to run %s", cmds[i]);
-        }
+    char *const set_address[] = {"ip", "addr", "add", firs_cidr_ip,
+                                 "dev", name, NULL};
+    char *const set_up[] = {"ip", "link", "set", name, "up", NULL};
+    if (td_run_command(set_address) != 0 || td_run_command(set_up) != 0) {
+        log_error("failed to configure bridge %s", name);
+        char *const delete_bridge[] = {"brctl", "delbr", name, NULL};
+        (void)td_run_command(delete_bridge);
+        (void)delete_network_info(name);
+        return -1;
     }
     return 0;
 }
 
 
-int update_network_info(char *name, struct network *nw) {
+static int update_network_info(struct network *nw) {
     int bufsize = 128;
-    struct network *nw_buffer = malloc(sizeof(struct network) * bufsize);
+    struct network *nw_buffer = malloc(sizeof(struct network) * (size_t)bufsize);
     if (nw_buffer == NULL) {
         log_error("failed alloc network buffer");
         return -1;
@@ -269,7 +265,7 @@ int update_network_info(char *name, struct network *nw) {
     return 0;
 }
 
-int create_default_bridge() {
+int create_default_bridge(void) {
     //如果网桥不存在就创建
     int ret_val = 0;
     if (net_has_exist(TINYDOCKER_DEFAULT_NETWORK_NAME) == 0) {
@@ -278,40 +274,49 @@ int create_default_bridge() {
     }
 
     //存在无论如何都启动一把
-    char set_up_cmd[128] = {0};
-    sprintf(set_up_cmd, "ip link set %s up", TINYDOCKER_DEFAULT_NETWORK_NAME);
-    system(set_up_cmd);
+    char *const set_up[] = {"ip", "link", "set",
+                            TINYDOCKER_DEFAULT_NETWORK_NAME, "up", NULL};
+    if (td_run_command(set_up) != 0) {
+        return -1;
+    }
 
     return ret_val;
 }
 
 
 int delte_network(char *name) {
-    char close_if[128] = {0};
-    sprintf(close_if, "ip link set dev %s down", name);
-    system(close_if);
-
-    char delte_br[128] = {0};
-    sprintf(delte_br, "sudo brctl delbr %s", name);
-    system(delte_br);
-
-    delete_network_info(name);
-    return 0;
+    if (if_nametoindex(name) != 0U) {
+        char *const set_down[] = {"ip", "link", "set", "dev", name,
+                                  "down", NULL};
+        char *const delete_bridge[] = {"brctl", "delbr", name, NULL};
+        if (td_run_command(set_down) != 0 ||
+            td_run_command(delete_bridge) != 0) {
+            log_error("failed to remove bridge %s", name);
+            return -1;
+        }
+    }
+    return delete_network_info(name);
 }
 
 void get_first_cidr_host_ip(char *cidr_network, char *cidr_host_ip, int size) {
     unsigned int minIP;
     unsigned int maxIP;
-    get_CIDR_range(cidr_network, &minIP, &maxIP);
+    unsigned int prefix;
+    if (get_cidr_range(cidr_network, &minIP, &maxIP, &prefix) != 0) {
+        if (size > 0) {
+            cidr_host_ip[0] = '\0';
+        }
+        return;
+    }
 
     //获取第一个IP
     int_to_str_ip(minIP + 1, cidr_host_ip, size); //加1是忽略0号主机
 
-    char buf[16] = {0};
-    int prefix;
-    sscanf(cidr_network, "%[^/]/%d", buf, &prefix);
-    sprintf(buf, "/%d", prefix);
-    strcat(cidr_host_ip, buf);
+    size_t used = strlen(cidr_host_ip);
+    if (used < (size_t)size) {
+        (void)snprintf(cidr_host_ip + used, (size_t)size - used,
+                       "/%u", prefix);
+    }
 }
 
 unsigned alloc_new_ip(char *name, char *ip, int buf_size) {
@@ -323,7 +328,9 @@ unsigned alloc_new_ip(char *name, char *ip, int buf_size) {
 
     unsigned int minIP;
     unsigned int maxIP;
-    get_CIDR_range(nw.cidr, &minIP, &maxIP);
+    if (get_cidr_range(nw.cidr, &minIP, &maxIP, NULL) != 0) {
+        return 0;
+    }
     //分配IP地址ID时候排除最小的IP和最大的IP和已经被分配的IP
     unsigned int_ip = 0;
     for (unsigned i = minIP + 2; i < maxIP - 1; i++) { //加2开始时为了避免分配主机号0,1和255, 1是这里被设置为网桥地址
@@ -340,7 +347,7 @@ unsigned alloc_new_ip(char *name, char *ip, int buf_size) {
     }
 
     nw.used_ips[nw.used_ip_cnt++] = int_ip;
-    if (update_network_info(nw.name, &nw) == -1) {
+    if (update_network_info(&nw) == -1) {
         log_info("failed to update network info: %s", nw.name);
     }
     
@@ -359,7 +366,10 @@ int release_used_ip(char *name, char *ip) {
         return -1;
     }
 
-    unsigned *old_ips = (unsigned *) malloc(sizeof(unsigned) * nw.used_ip_cnt);
+    if (nw.used_ip_cnt < 0) {
+        return -1;
+    }
+    unsigned *old_ips = malloc(sizeof(unsigned) * (size_t)nw.used_ip_cnt);
     for (int i = 0; i < nw.used_ip_cnt; i++) {
         old_ips[i] = nw.used_ips[i];
     }
@@ -375,7 +385,7 @@ int release_used_ip(char *name, char *ip) {
 
     free(old_ips);
 
-    int ret = update_network_info(nw.name, &nw);
+    int ret = update_network_info(&nw);
     if (ret == -1) {
         log_info("failed to update network info: %s", nw.name);
     }
@@ -384,7 +394,7 @@ int release_used_ip(char *name, char *ip) {
 }
 
 
-void list_network() {
+void list_network(void) {
     struct network nw_buffer[100];
     int cnt = get_network_list(nw_buffer, 100);
     printf("%-10s\t%s\t%-18s\t%s\n", "NAME", "DRIVER", "CIDR", "ALLOC_IPS");
@@ -433,51 +443,49 @@ int connect_container(char *container_name, char *network, char *ip_addr) {
 
     //生成veth的名字
     char *veth_container = "eth0";
-    char veth_host[20] = {0};
-    snprintf(veth_host, 16, "%s-%s", "tdbr", container_name); //veth名字长度显示是16
+    char veth_host[16] = {0};
+    char pid_text[32] = {0};
+    char container_address[64] = {0};
+    if (td_make_veth_name(container_name, veth_host, sizeof(veth_host)) != 0 ||
+        snprintf(pid_text, sizeof(pid_text), "%d", one_pid) < 0 ||
+        snprintf(container_address, sizeof(container_address), "%s/24", str_ip) < 0) {
+        (void)release_used_ip(network, str_ip);
+        return -1;
+    }
 
-    //创建veth peer
-    char add_veth_peer[128] = {0};
-    sprintf(add_veth_peer, "ip link add %s type veth peer name %s", veth_container, veth_host);
+    char *const add_veth[] = {"ip", "link", "add", veth_container, "type",
+                              "veth", "peer", "name", veth_host, NULL};
+    char *const add_to_bridge[] = {"brctl", "addif", network, veth_host, NULL};
+    char *const host_up[] = {"ip", "link", "set", veth_host, "up", NULL};
+    char *const move_peer[] = {"ip", "link", "set", "dev", veth_container,
+                               "netns", pid_text, NULL};
+    char *const add_loopback[] = {"nsenter", "-t", pid_text, "-n", "ip",
+                                  "addr", "add", "127.0.0.1/8", "dev", "lo", NULL};
+    char *const loopback_up[] = {"nsenter", "-t", pid_text, "-n", "ip",
+                                 "link", "set", "lo", "up", NULL};
+    char *const add_address[] = {"nsenter", "-t", pid_text, "-n", "ip",
+                                 "addr", "add", container_address, "dev",
+                                 veth_container, NULL};
+    char *const container_up[] = {"nsenter", "-t", pid_text, "-n", "ip",
+                                  "link", "set", veth_container, "up", NULL};
+    char *const add_route[] = {"nsenter", "-t", pid_text, "-n", "ip",
+                               "route", "add", "default", "via",
+                               TINYDOCKER_DEFAULT_GATEWAY, "dev", veth_container, NULL};
 
-    //将veth一端连接到网桥
-    char brctl_addif[128] = {0};
-    sprintf(brctl_addif, "brctl addif %s %s", network, veth_host);
-    //并启动网桥端的veth
-    char set_host_peer_up[128] = {0};
-    sprintf(set_host_peer_up, "ip link set %s up", veth_host);
-
-    //将veth的另一端放入容器中
-    char set_veth_container_into_container[128] = {0};
-    sprintf(set_veth_container_into_container, "ip link set dev %s netns %d", veth_container, one_pid);
-
-    //设置容器回环地址
-    char add_loif[128];
-    sprintf(add_loif, "nsenter -t %d -n ip addr add 127.0.0.1/8 dev lo", one_pid);
-    char set_loifup[128];
-    sprintf(set_loifup, "nsenter -t %d -n ip link set lo up", one_pid);
-
-
-    //设置容器网桥地址
-    char add_container_addr[128];
-    sprintf(add_container_addr, "nsenter -t %d -n ip addr add %s/24 dev %s", one_pid, str_ip, veth_container);
-    char set_container_ifup[128];
-    sprintf(set_container_ifup, "nsenter -t %d -n ip link set %s up", one_pid, veth_container);
-
-
-    //设置容器路由
-    char set_route[128] = {0};
-    sprintf(set_route, "nsenter -t %d -n ip route add default via %s dev eth0", one_pid, TINYDOCKER_DEFAULT_GATEWAY);
-        
-    //开始执行上述命令
-    char *cmds[] = {add_veth_peer, brctl_addif, set_host_peer_up, set_veth_container_into_container, \
-                    add_loif, set_loifup, add_container_addr, set_container_ifup, set_route, NULL};
-
-    for (int i = 0; cmds[i] != NULL; i++) {
-        if (system(cmds[i]) != 0) {
-            log_error("failed run: %s", cmds[i]);
-            return -1;
-        }
+    if (td_run_command(add_veth) != 0 ||
+        td_run_command(add_to_bridge) != 0 ||
+        td_run_command(host_up) != 0 ||
+        td_run_command(move_peer) != 0 ||
+        td_run_command(add_loopback) != 0 ||
+        td_run_command(loopback_up) != 0 ||
+        td_run_command(add_address) != 0 ||
+        td_run_command(container_up) != 0 ||
+        td_run_command(add_route) != 0) {
+        char *const delete_veth[] = {"ip", "link", "delete", veth_host, NULL};
+        (void)td_run_command(delete_veth);
+        (void)release_used_ip(network, str_ip);
+        log_error("failed to configure network for container %s", container_name);
+        return -1;
     }
 
     strcpy(ip_addr, str_ip);
@@ -485,58 +493,143 @@ int connect_container(char *container_name, char *network, char *ip_addr) {
 }
 
 int disconnect_container(char *container_name, char *network) {
-    char veth_host[20] = {0};
-    snprintf(veth_host, 16, "%s-%s", "tdbr", container_name); //veth名字长度显示是16
-
-    //关闭host段的peer, 然后从默认网桥下拔出
-    char set_host_peer_down[128] = {0};
-    sprintf(set_host_peer_down, "ip link set %s down", veth_host);
-    
-    char brctl_delif[128] = {0};
-    sprintf(brctl_delif, "brctl delif %s %s", network, veth_host);
-
-    //开始执行上述命令
-    char *cmds[] = {brctl_delif, set_host_peer_down, NULL};
-    for (int i = 0; cmds[i] != NULL; i++) {
-        if (system(cmds[i]) != 0) {
-            log_error("failed run: %s", cmds[i]);
-            return -1;
-        }
+    char veth_host[16] = {0};
+    if (td_make_veth_name(container_name, veth_host, sizeof(veth_host)) != 0) {
+        return -1;
+    }
+    if (if_nametoindex(veth_host) == 0U) {
+        return 0;
+    }
+    char *const remove_from_bridge[] = {"brctl", "delif", network,
+                                        veth_host, NULL};
+    char *const delete_veth[] = {"ip", "link", "delete", veth_host, NULL};
+    if (td_run_command(remove_from_bridge) != 0 ||
+        td_run_command(delete_veth) != 0) {
+        log_error("failed to disconnect veth %s", veth_host);
+        return -1;
     }
     return 0;
 }
 
 
-void set_container_port_map(char *container_ip, int port_cnt, struct port_map *port_maps) {
+int set_container_port_map(char *container_ip, int port_cnt, struct port_map *port_maps) {
+    struct in_addr parsed_address;
+    if (container_ip == NULL || inet_pton(AF_INET, container_ip, &parsed_address) != 1 ||
+        port_cnt < 0 || (port_cnt > 0 && port_maps == NULL)) {
+        log_error("invalid port mapping inputs");
+        return -1;
+    }
     for (int i = 0; i < port_cnt; i++) {
         int host_port = port_maps[i].host_port;
         int container_port = port_maps[i].container_port;
-
-        char output_dnat[128] = {0}; //用户本机访问容器的端口转发, 因为PREROUTING只对来自宿主机外部请求起作用
-        sprintf(output_dnat, "iptables -t nat -A OUTPUT -p tcp --dport %d -j DNAT --to-destination %s:%d", host_port, container_ip, container_port);
-        char prerouting_dnat[128] = {0}; //用户外部机器访问host主机时的端口转发
-        sprintf(prerouting_dnat, "iptables -t nat -A PREROUTING -p tcp -m tcp --dport %d -j DNAT --to-destination %s:%d", host_port, container_ip, container_port);
-       
-        char *cmds[] = {output_dnat, prerouting_dnat, NULL};
-        for (int i = 0; cmds[i] != NULL; i++) {
-            int ret = system(cmds[i]);
-            if (ret != 0) {
-                log_error("failed to run %s, ret:%d", cmds[i], ret);
-            }
+        char host_port_text[8] = {0};
+        char destination[64] = {0};
+        if (snprintf(host_port_text, sizeof(host_port_text), "%d", host_port) < 0 ||
+            snprintf(destination, sizeof(destination), "%s:%d", container_ip,
+                     container_port) < 0) {
+            return -1;
+        }
+        char *const add_output[] = {
+            "iptables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp",
+            "--dport", host_port_text, "-j", "DNAT", "--to-destination",
+            destination, NULL
+        };
+        char *const add_prerouting[] = {
+            "iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp",
+            "-m", "tcp", "--dport", host_port_text, "-j", "DNAT",
+            "--to-destination", destination, NULL
+        };
+        if (td_run_command(add_output) != 0) {
+            log_error("failed to add OUTPUT DNAT for port %d", host_port);
+            return -1;
+        }
+        if (td_run_command(add_prerouting) != 0) {
+            char *const delete_output[] = {
+                "iptables", "-t", "nat", "-D", "OUTPUT", "-p", "tcp",
+                "--dport", host_port_text, "-j", "DNAT", "--to-destination",
+                destination, NULL
+            };
+            (void)td_run_command(delete_output);
+            log_error("failed to add PREROUTING DNAT for port %d", host_port);
+            return -1;
         }
         log_info("set host port %d map to container port %d successful", host_port, container_port);
     }
+    return 0;
 }
 
-void unset_container_port_map(char *container_ip) {
-    char pattern[64] = {0};
-    sprintf(pattern, "DNAT --to-destination %s", container_ip);
-    char bash_script[1024] = {0};
-    sprintf(bash_script, "iptables -t nat -S | grep '%s' | while IFS= read -r rule; do iptables -t nat -D ${rule#\"-A\"}; done", pattern);
-    int ret = system(bash_script);
-    if (ret == 0) {
-        log_info("unset  container port map for container ip %s successful", container_ip);
-    } else {
-        log_info("unset  container port map for container ip %s ret:%d", container_ip, ret);
+static int delete_dnat_rules_for_chain(const char *chain, const char *container_ip) {
+    char *output = NULL;
+    size_t output_size = 0U;
+    char destination_prefix[64] = {0};
+    char *list_arguments[] = {"iptables", "-t", "nat", "-S", (char *)chain, NULL};
+    int result = 0;
+
+    if (snprintf(destination_prefix, sizeof(destination_prefix), "%s:",
+                 container_ip) < 0 ||
+        td_capture_command(list_arguments, &output, &output_size) != 0) {
+        free(output);
+        return -1;
     }
+    (void)output_size;
+    char *save_line = NULL;
+    char *line = strtok_r(output, "\n", &save_line);
+    while (line != NULL) {
+        char *tokens[32] = {0};
+        size_t token_count = 0U;
+        char *save_token = NULL;
+        char *token = strtok_r(line, " \t", &save_token);
+        int matches_destination = 0;
+
+        while (token != NULL && token_count < 32U) {
+            tokens[token_count++] = token;
+            token = strtok_r(NULL, " \t", &save_token);
+        }
+        for (size_t index = 0U; index + 1U < token_count; index++) {
+            if (strcmp(tokens[index], "--to-destination") == 0 &&
+                strncmp(tokens[index + 1U], destination_prefix,
+                        strlen(destination_prefix)) == 0) {
+                matches_destination = 1;
+                break;
+            }
+        }
+        if (matches_destination != 0 && token_count >= 2U &&
+            strcmp(tokens[0], "-A") == 0 && strcmp(tokens[1], chain) == 0) {
+            char *delete_arguments[36] = {
+                "iptables", "-t", "nat", "-D", (char *)chain, NULL
+            };
+            size_t delete_count = 5U;
+            for (size_t index = 2U; index < token_count && delete_count < 35U;
+                 index++) {
+                delete_arguments[delete_count++] = tokens[index];
+            }
+            delete_arguments[delete_count] = NULL;
+            if (delete_count != token_count + 3U ||
+                td_run_command(delete_arguments) != 0) {
+                result = -1;
+            }
+        }
+        line = strtok_r(NULL, "\n", &save_line);
+    }
+    free(output);
+    return result;
+}
+
+int unset_container_port_map(char *container_ip) {
+    struct in_addr parsed_address;
+    if (container_ip == NULL || container_ip[0] == '\0') {
+        return 0;
+    }
+    if (inet_pton(AF_INET, container_ip, &parsed_address) != 1) {
+        log_error("refusing to remove port mappings for invalid IP: %s", container_ip);
+        return -1;
+    }
+    int output_result = delete_dnat_rules_for_chain("OUTPUT", container_ip);
+    int prerouting_result = delete_dnat_rules_for_chain("PREROUTING", container_ip);
+    if (output_result != 0 || prerouting_result != 0) {
+        log_error("failed to remove all DNAT rules for %s", container_ip);
+        return -1;
+    }
+    log_info("removed container port mappings for %s", container_ip);
+    return 0;
 }

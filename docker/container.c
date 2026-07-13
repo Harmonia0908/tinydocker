@@ -57,14 +57,20 @@ int init_docker_env() {
         return -1;
     }
 
-    //添加iptables支持外部响应可以返回到容器内部
-    char iptable_rule[129] = {0}; //创建IP规则
-    sprintf(iptable_rule, "-t nat -A POSTROUTING -s %s -j MASQUERADE", TINYDOCKER_DEFAULT_NETWORK_CIDR);
-    char bash_script[1024] = {0}; //检查规则是否已经存在, 如果规则不存在，添加它
-    sprintf(bash_script, "if ! iptables -C %s 2>/dev/null; then iptables %s; fi", iptable_rule, iptable_rule);
-    if (system(bash_script) != 0) {
-        log_error("failed to ensure default MASQUERADE rule");
-        return -1;
+    //添加iptables支持外部响应可以返回到容器内部，不经过 shell。
+    char *const check_rule[] = {
+        "iptables", "-t", "nat", "-C", "POSTROUTING", "-s",
+        TINYDOCKER_DEFAULT_NETWORK_CIDR, "-j", "MASQUERADE", NULL
+    };
+    if (td_run_command(check_rule) != 0) {
+        char *const add_rule[] = {
+            "iptables", "-t", "nat", "-A", "POSTROUTING", "-s",
+            TINYDOCKER_DEFAULT_NETWORK_CIDR, "-j", "MASQUERADE", NULL
+        };
+        if (td_run_command(add_rule) != 0) {
+            log_error("failed to ensure default MASQUERADE rule");
+            return -1;
+        }
     }
     return 0;
 }
@@ -167,7 +173,7 @@ static void cleanup_run_failure(struct docker_run_arguments *args, char *mountpo
     }
 
     if (ip_addr != NULL && strlen(ip_addr) > 0) {
-        unset_container_port_map(ip_addr);
+        (void)unset_container_port_map(ip_addr);
         if (disconnect_container(args->name, TINYDOCKER_DEFAULT_NETWORK_NAME) != 0) {
             log_warn("failed to disconnect container network: %s", args->name);
         }
@@ -367,7 +373,11 @@ int docker_run(struct docker_run_arguments *args) {
     }
 
     //设置端口映射
-    set_container_port_map(ip_addr, args->port_mapping_cnt, args->port_mapping);
+    if (set_container_port_map(ip_addr, args->port_mapping_cnt,
+                               args->port_mapping) != 0) {
+        log_error("failed to configure port mappings for %s", args->name);
+        goto fail_cleanup_run;
+    }
 
     //记录容器信息
     int start_time = time(NULL);

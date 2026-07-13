@@ -83,6 +83,15 @@ static void test_safe_paths(void)
     CHECK(strstr(error, "traversal") != NULL);
     CHECK(td_join_rootfs_path("/runtime/root", "/", output,
                               sizeof(output), error, sizeof(error)) == -1);
+
+    char first_veth[16] = {0};
+    char second_veth[16] = {0};
+    CHECK(td_make_veth_name("same-prefix-container-a", first_veth,
+                            sizeof(first_veth)) == 0);
+    CHECK(td_make_veth_name("same-prefix-container-b", second_veth,
+                            sizeof(second_veth)) == 0);
+    CHECK(strlen(first_veth) <= 15U);
+    CHECK(strcmp(first_veth, second_veth) != 0);
 }
 
 static void test_cidr_and_cgroup_parsing(void)
@@ -222,8 +231,18 @@ static void test_directory_creation_stays_beneath_rootfs(void)
 static void test_shell_free_command_runner(void)
 {
     char *const arguments[] = {"true", NULL};
+    char *const capture_arguments[] = {"printf", "%s", "captured", NULL};
+    char *output = NULL;
+    size_t output_size = 0U;
 
     CHECK(td_run_command(arguments) == 0);
+    CHECK(td_capture_command(capture_arguments, &output, &output_size) == 0);
+    CHECK(output != NULL);
+    if (output != NULL) {
+        CHECK(output_size == 8U);
+        CHECK(strcmp(output, "captured") == 0);
+    }
+    free(output);
 }
 
 int main(void)

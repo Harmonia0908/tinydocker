@@ -21,5 +21,7 @@ int td_join_rootfs_path(const char *rootfs, const char *container_path,
 int td_parse_proc_stat_start_time(const char *stat_line,
                                   unsigned long long *start_time,
                                   char *error, size_t error_size);
+int td_make_veth_name(const char *container_name, char *output,
+                      size_t output_size);
 
 #endif

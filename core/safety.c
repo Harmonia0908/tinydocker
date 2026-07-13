@@ -302,3 +302,25 @@ int td_parse_proc_stat_start_time(const char *stat_line,
     set_error(error, error_size, "process start time field is missing");
     return -1;
 }
+
+int td_make_veth_name(const char *container_name, char *output,
+                      size_t output_size)
+{
+    uint32_t hash = UINT32_C(2166136261);
+    const unsigned char *cursor;
+    char error[160] = {0};
+    int written;
+
+    if (output == NULL || output_size < 16U ||
+        td_validate_name(container_name, 127U, error, sizeof(error)) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (cursor = (const unsigned char *)container_name; *cursor != '\0'; cursor++) {
+        hash ^= (uint32_t)*cursor;
+        hash *= UINT32_C(16777619);
+    }
+    written = snprintf(output, output_size, "td%.6s-%06x", container_name,
+                       (unsigned int)(hash & UINT32_C(0x00ffffff)));
+    return written == 15 ? 0 : -1;
+}
