@@ -325,6 +325,16 @@ int td_make_veth_name(const char *container_name, char *output,
     return written == 15 ? 0 : -1;
 }
 
+int td_make_veth_peer_name(const char *container_name, char *output,
+                           size_t output_size)
+{
+    if (td_make_veth_name(container_name, output, output_size) != 0) {
+        return -1;
+    }
+    output[1] = 'p';
+    return 0;
+}
+
 int td_archive_entry_is_safe(const char *entry_name)
 {
     if (entry_name == NULL || entry_name[0] == '\0' || entry_name[0] == '/' ||

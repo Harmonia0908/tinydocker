@@ -13,8 +13,8 @@ WARNINGS := -std=c11 -Wall -Wextra -Wpedantic -Wformat=2 \
 	-Wconversion -Wstrict-prototypes -Wmissing-prototypes
 STRICT_WARNINGS := $(WARNINGS) -Werror
 
-CORE_SOURCES := core/safety.c core/cgroup_parse.c core/status_codec.c core/fs.c \
-	core/process.c
+CORE_SOURCES := core/safety.c core/cgroup_parse.c core/status_codec.c \
+	core/network_state.c core/fs.c core/process.c
 RUNTIME_SOURCES := logger/log.c util/utils.c cmdparser/cmdparser.c \
 	docker/cgroup.c docker/container.c docker/network.c docker/status_info.c \
 	docker/volumes.c docker/workspace.c main.c

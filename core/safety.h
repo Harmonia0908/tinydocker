@@ -23,6 +23,8 @@ int td_parse_proc_stat_start_time(const char *stat_line,
                                   char *error, size_t error_size);
 int td_make_veth_name(const char *container_name, char *output,
                       size_t output_size);
+int td_make_veth_peer_name(const char *container_name, char *output,
+                           size_t output_size);
 int td_archive_entry_is_safe(const char *entry_name);
 
 #endif

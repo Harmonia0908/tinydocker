@@ -8,15 +8,6 @@
 #include "../cmdparser/cmdparser.h"
 #include "../core/config.h"
 
-struct network {
-    char *name; //网络名
-    char *cidr; //网段地址
-    char *driver; //网络驱动名
-    unsigned *used_ips; //已经分配的IP
-    int used_ip_cnt; //使用的IP数量
-};
-
-
 int delte_network(char *name);
 int create_default_bridge(void);
 int create_network(char *name, char *cidr, char *driver);

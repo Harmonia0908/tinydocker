@@ -3,22 +3,28 @@
 #include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <net/if.h>
 #include <stdint.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "network.h"
 #include "cgroup.h"
 #include "status_info.h"
 #include "../cmdparser/cmdparser.h"
 #include "../logger/log.h"
 #include "../core/process.h"
+#include "../core/network_state.h"
 #include "../core/safety.h"
 
 
 //IP地址转主机序整数
-static unsigned int str_ip_to_int(char *ip) {
+static unsigned int str_ip_to_int(const char *ip) {
     struct in_addr addr;
-    addr.s_addr = inet_addr(ip);
-    inet_aton(ip, &addr);
+    if (ip == NULL || inet_pton(AF_INET, ip, &addr) != 1) {
+        return 0U;
+    }
     return ntohl(addr.s_addr);
 }
 
@@ -55,124 +61,245 @@ static int get_cidr_range(const char *cidr, unsigned int *minimum,
 }
 
 
-static int write_network_info(struct network nw) {
-    FILE* file = fopen(CONTAINER_NETWORKS_FILE, "a");
-    if (file == NULL) {
-        log_error("failed to open %s, error: %s", CONTAINER_NETWORKS_FILE, strerror(errno));
-        return -1;
-    }
-
-    //name:driver:cidr:ip1;ip2;ip3
-    char buf[4096] = {0};
-    sprintf(buf, "%s:%s:%s:", nw.name, nw.driver, nw.cidr);
-    for (int i = 0; i < nw.used_ip_cnt; i++) {
-        char int_str[32] = {0};
-        sprintf(int_str, "%u;", nw.used_ips[i]);
-        strcat(buf, int_str);
-    }
-    //log_info("write network info: %s", buf);
-    int ret = fprintf(file, "%s\n", buf);
-    fclose(file);
-    return ret > 0 ? 0 : -1;
-}  
-
-
-static int get_network_list(struct network *nw_buffer, int bufsize) {
-    FILE* file = fopen(CONTAINER_NETWORKS_FILE, "r");
-    if (file == NULL) {
-        log_error("failed to open %s, error: %s", CONTAINER_NETWORKS_FILE, strerror(errno));
-        return -1;
-    }
-
-    //name:driver:cidr:ip1;ip2;ip3
-    int line_cnt = 0;
+static int load_network_records(struct td_network_record *records,
+                                size_t capacity, size_t *record_count) {
+    enum { MAX_NETWORK_STATE_SIZE = 1024 * 1024 };
     char line[4096] = {0};
-    while (fgets(line, sizeof(line), file) != NULL) {
-        struct network nw;
-        nw.name = (char *) malloc(64);
-        nw.driver = (char *) malloc(64);
-        nw.cidr = (char *) malloc(64);
-        nw.used_ips = (unsigned *) malloc(sizeof(unsigned) * 128);
+    struct stat status;
+    int state_fd;
+    FILE *file;
+    size_t count = 0U;
 
-        line[strcspn(line, "\n")] = '\0';
-        char* token = strtok(line, ":");
-        strcpy(nw.name, token);
-        token = strtok(NULL, ":");
-        strcpy(nw.driver, token);
-        token = strtok(NULL, ":");
-        strcpy(nw.cidr, token);
-
-
-        char *ip_list = strtok(NULL, ":");
-
-        //printf("read %s |: %s %s %s %s\n", line, nw.name, nw.driver, nw.cidr, ip_list);
-        char *ip_token = strtok(ip_list, ";");
-        int ip_cnt = 0;
-        while (ip_token != NULL) {
-            nw.used_ips[ip_cnt++] = (unsigned) atol(ip_token);
-            ip_token = strtok(NULL, ";");
-        }
-        nw.used_ip_cnt = ip_cnt;
-        nw_buffer[line_cnt++] = nw;
-        if (line_cnt == bufsize) {
-            break;
-        }
-        memset(line, 0, 4096);
-    }
-    fclose(file);
-
-    //printf("list end, get %d lines\n", line_cnt);
-    return line_cnt;
-}
-
-
-static int read_network_info(char *name, struct network *nw) {
-    int bufsize = 128;
-    struct network *nw_buffer = malloc(sizeof(struct network) * (size_t)bufsize);
-    int size = get_network_list(nw_buffer, bufsize);
-    int ok = -1;
-    for (int i = 0; i < size; i++) {
-        if (strcmp(nw_buffer[i].name, name) == 0) {
-            memcpy(nw, &nw_buffer[i], sizeof(struct network));
-            ok = 0;
-            break;
-        }
-    }
-    return ok;
-}
-
-
-static int delete_network_info(char *name) {
-    int bufsize = 128;
-    struct network *nw_buffer = malloc(sizeof(struct network) * (size_t)bufsize);
-    if (nw_buffer == NULL) {
-        log_error("failed alloc network buffer");
+    if (records == NULL || capacity == 0U || record_count == NULL) {
+        errno = EINVAL;
         return -1;
     }
-    int size = get_network_list(nw_buffer, bufsize);
-
-    // 打开文件以清空内容
-    FILE *file = fopen(CONTAINER_NETWORKS_FILE, "w");
+    state_fd = open(CONTAINER_NETWORKS_FILE, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (state_fd < 0) {
+        if (errno == ENOENT) {
+            *record_count = 0U;
+            return 0;
+        }
+        log_error("failed to open %s: %s", CONTAINER_NETWORKS_FILE,
+                  strerror(errno));
+        return -1;
+    }
+    if (fstat(state_fd, &status) != 0 || !S_ISREG(status.st_mode) ||
+        status.st_size < 0 || status.st_size > MAX_NETWORK_STATE_SIZE) {
+        log_error("network state is not a safe regular file");
+        (void)close(state_fd);
+        return -1;
+    }
+    file = fdopen(state_fd, "r");
     if (file == NULL) {
-        log_error("failed update network info, can not open %s", CONTAINER_NETWORKS_FILE);
-        free(nw_buffer);
+        (void)close(state_fd);
         return -1;
     }
-    fclose(file);
+    while (fgets(line, sizeof(line), file) != NULL) {
+        char error[160] = {0};
+        size_t length = strlen(line);
 
-    // 重新写入数据到文件
-    for (int i = 0; i < size; i++) {
-        if (strcmp(nw_buffer[i].name, name) == 0) {
-            continue;
+        if (length == 0U || (line[length - 1U] != '\n' && !feof(file))) {
+            log_error("network state contains an oversized record");
+            (void)fclose(file);
+            return -1;
         }
-        if (write_network_info(nw_buffer[i]) == -1) {
-            log_error("failed update network info");
-            free(nw_buffer);
+        line[strcspn(line, "\r\n")] = '\0';
+        if (count >= capacity ||
+            td_parse_network_record(line, &records[count], error,
+                                    sizeof(error)) != 0) {
+            log_error("corrupt network state record: %s",
+                      count >= capacity ? "record capacity exceeded" : error);
+            (void)fclose(file);
+            return -1;
+        }
+        count++;
+    }
+    if (ferror(file) != 0) {
+        log_error("failed to read network state: %s", strerror(errno));
+        (void)fclose(file);
+        return -1;
+    }
+    if (fclose(file) != 0) {
+        log_error("failed to close network state: %s", strerror(errno));
+        return -1;
+    }
+    *record_count = count;
+    return 0;
+}
+
+static int lock_network_state(void) {
+    char lock_path[1024] = {0};
+    int lock_fd;
+    int written = snprintf(lock_path, sizeof(lock_path), "%s.lock",
+                           CONTAINER_NETWORKS_FILE);
+
+    if (written < 0 || (size_t)written >= sizeof(lock_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    lock_fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
+                   S_IRUSR | S_IWUSR);
+    if (lock_fd < 0) {
+        return -1;
+    }
+    while (flock(lock_fd, LOCK_EX) != 0) {
+        if (errno != EINTR) {
+            (void)close(lock_fd);
             return -1;
         }
     }
-    free(nw_buffer);
+    return lock_fd;
+}
+
+static int write_network_records(const struct td_network_record *records,
+                                 size_t record_count) {
+    char temporary_path[1024] = {0};
+    int temporary_fd = -1;
+    FILE *file = NULL;
+    int result = -1;
+
+    for (unsigned int attempt = 0U; attempt < 100U; attempt++) {
+        int written = snprintf(temporary_path, sizeof(temporary_path),
+                               "%s.tmp.%ld.%u", CONTAINER_NETWORKS_FILE,
+                               (long)getpid(), attempt);
+        if (written < 0 || (size_t)written >= sizeof(temporary_path)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        temporary_fd = open(temporary_path,
+                            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                            S_IRUSR | S_IWUSR);
+        if (temporary_fd >= 0 || errno != EEXIST) {
+            break;
+        }
+    }
+    if (temporary_fd < 0) {
+        return -1;
+    }
+    file = fdopen(temporary_fd, "w");
+    if (file == NULL) {
+        goto cleanup;
+    }
+    temporary_fd = -1;
+    for (size_t index = 0U; index < record_count; index++) {
+        char serialized[4096] = {0};
+        char error[160] = {0};
+        if (td_format_network_record(&records[index], serialized,
+                                     sizeof(serialized), error,
+                                     sizeof(error)) != 0 ||
+            fprintf(file, "%s\n", serialized) < 0) {
+            log_error("failed to serialize network state: %s", error);
+            goto cleanup;
+        }
+    }
+    if (fflush(file) != 0 || fsync(fileno(file)) != 0) {
+        goto cleanup;
+    }
+    if (fclose(file) != 0) {
+        file = NULL;
+        goto cleanup;
+    }
+    file = NULL;
+    if (rename(temporary_path, CONTAINER_NETWORKS_FILE) != 0) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (file != NULL) {
+        (void)fclose(file);
+    } else if (temporary_fd >= 0) {
+        (void)close(temporary_fd);
+    }
+    if (result != 0) {
+        (void)unlink(temporary_path);
+    }
+    return result;
+}
+
+static int add_network_info(const struct td_network_record *network) {
+    struct td_network_record records[TD_NETWORK_MAX_RECORDS];
+    size_t count = 0U;
+    int lock_fd = lock_network_state();
+    int result = -1;
+
+    if (lock_fd < 0) {
+        return -1;
+    }
+    if (load_network_records(records, TD_NETWORK_MAX_RECORDS, &count) != 0 ||
+        count >= TD_NETWORK_MAX_RECORDS) {
+        goto cleanup;
+    }
+    for (size_t index = 0U; index < count; index++) {
+        if (strcmp(records[index].name, network->name) == 0) {
+            errno = EEXIST;
+            goto cleanup;
+        }
+    }
+    records[count++] = *network;
+    result = write_network_records(records, count);
+
+cleanup:
+    (void)close(lock_fd);
+    return result;
+}
+
+static int read_network_info(const char *name, struct td_network_record *network) {
+    struct td_network_record records[TD_NETWORK_MAX_RECORDS];
+    size_t count = 0U;
+
+    if (load_network_records(records, TD_NETWORK_MAX_RECORDS, &count) != 0) {
+        return -1;
+    }
+    for (size_t index = 0U; index < count; index++) {
+        if (strcmp(records[index].name, name) == 0) {
+            *network = records[index];
+            return 0;
+        }
+    }
+    errno = ENOENT;
+    return -1;
+}
+
+static int network_info_exists(const char *name) {
+    struct td_network_record records[TD_NETWORK_MAX_RECORDS];
+    size_t count = 0U;
+
+    if (load_network_records(records, TD_NETWORK_MAX_RECORDS, &count) != 0) {
+        return -1;
+    }
+    for (size_t index = 0U; index < count; index++) {
+        if (strcmp(records[index].name, name) == 0) {
+            return 1;
+        }
+    }
     return 0;
+}
+
+static int delete_network_info(const char *name) {
+    struct td_network_record records[TD_NETWORK_MAX_RECORDS];
+    size_t count = 0U;
+    size_t output_count = 0U;
+    int lock_fd = lock_network_state();
+    int result = -1;
+
+    if (lock_fd < 0) {
+        return -1;
+    }
+    if (load_network_records(records, TD_NETWORK_MAX_RECORDS, &count) != 0) {
+        goto cleanup;
+    }
+    for (size_t index = 0U; index < count; index++) {
+        if (strcmp(records[index].name, name) != 0) {
+            records[output_count++] = records[index];
+        }
+    }
+    result = write_network_records(records, output_count);
+
+cleanup:
+    (void)close(lock_fd);
+    return result;
 }
 
 
@@ -181,8 +308,42 @@ static int net_has_exist(char *brname) {
 }
 
 int create_network(char *name, char *cidr_network, char *driver) {
-    // 暂时只支持网桥
-    if (strcmp(driver, "bridge") != 0) {
+    struct td_network_record network_record;
+    char serialized[4096] = {0};
+    char validation_error[160] = {0};
+    int metadata_exists;
+    int name_length;
+    int driver_length;
+    int cidr_length;
+
+    memset(&network_record, 0, sizeof(network_record));
+    if (name == NULL || cidr_network == NULL || driver == NULL) {
+        log_error("invalid network configuration: null field");
+        return -1;
+    }
+    name_length = snprintf(network_record.name, sizeof(network_record.name),
+                           "%s", name);
+    driver_length = snprintf(network_record.driver,
+                             sizeof(network_record.driver), "%s", driver);
+    cidr_length = snprintf(network_record.cidr, sizeof(network_record.cidr),
+                           "%s", cidr_network);
+    if (name_length < 0 || (size_t)name_length >= sizeof(network_record.name) ||
+        driver_length < 0 ||
+        (size_t)driver_length >= sizeof(network_record.driver) ||
+        cidr_length < 0 || (size_t)cidr_length >= sizeof(network_record.cidr) ||
+        td_format_network_record(&network_record, serialized,
+                                 sizeof(serialized), validation_error,
+                                 sizeof(validation_error)) != 0) {
+        log_error("invalid network configuration: %s", validation_error);
+        return -1;
+    }
+    metadata_exists = network_info_exists(name);
+    if (metadata_exists < 0) {
+        log_error("refusing network creation while state is unreadable");
+        return -1;
+    }
+    if (metadata_exists > 0) {
+        log_error("network metadata already exists: %s", name);
         return -1;
     }
 
@@ -192,14 +353,6 @@ int create_network(char *name, char *cidr_network, char *driver) {
         return -1;
     }
 
-    struct network nw = {
-        .name = name,
-        .driver = driver,
-        .cidr = cidr_network,
-        .used_ips = NULL,
-        .used_ip_cnt = 0
-    };
-
     //创建网桥
     char *const add_bridge[] = {"brctl", "addbr", name, NULL};
     if (td_run_command(add_bridge) != 0) {
@@ -208,7 +361,7 @@ int create_network(char *name, char *cidr_network, char *driver) {
     }
 
     //写入网络信息
-    if (write_network_info(nw) == -1) {
+    if (add_network_info(&network_record) == -1) {
         log_error("failed to save network info: %s", name);
         char *const delete_bridge[] = {"brctl", "delbr", name, NULL};
         (void)td_run_command(delete_bridge);
@@ -224,46 +377,17 @@ int create_network(char *name, char *cidr_network, char *driver) {
     if (td_run_command(set_address) != 0 || td_run_command(set_up) != 0) {
         log_error("failed to configure bridge %s", name);
         char *const delete_bridge[] = {"brctl", "delbr", name, NULL};
-        (void)td_run_command(delete_bridge);
-        (void)delete_network_info(name);
+        if (td_run_command(delete_bridge) == 0) {
+            (void)delete_network_info(name);
+        } else {
+            log_error("bridge rollback failed; keeping network metadata for safe retry: %s",
+                      name);
+        }
         return -1;
     }
     return 0;
 }
 
-
-static int update_network_info(struct network *nw) {
-    int bufsize = 128;
-    struct network *nw_buffer = malloc(sizeof(struct network) * (size_t)bufsize);
-    if (nw_buffer == NULL) {
-        log_error("failed alloc network buffer");
-        return -1;
-    }
-    int size = get_network_list(nw_buffer, bufsize);
-
-     // 打开文件以清空内容
-    FILE *file = fopen(CONTAINER_NETWORKS_FILE, "w");
-    if (file == NULL) {
-        log_error("failed update network info, can not open %s", CONTAINER_NETWORKS_FILE);
-        free(nw_buffer);
-        return -1;
-    }
-    fclose(file);
-
-    // 重新写入数据到文件
-    for (int i = 0; i < size; i++) {
-        if (strcmp(nw_buffer[i].name, nw->name) == 0) {
-            nw_buffer[i] = *nw; //用新的覆盖旧的
-        }
-        if (write_network_info(nw_buffer[i]) == -1) {
-            log_error("failed update network info");
-            free(nw_buffer);
-            return -1;
-        }
-    }
-    free(nw_buffer);
-    return 0;
-}
 
 int create_default_bridge(void) {
     //如果网桥不存在就创建
@@ -271,6 +395,14 @@ int create_default_bridge(void) {
     if (net_has_exist(TINYDOCKER_DEFAULT_NETWORK_NAME) == 0) {
         log_info("init detail bridge network %s for tinydocker", TINYDOCKER_DEFAULT_NETWORK_NAME);
         ret_val = create_network(TINYDOCKER_DEFAULT_NETWORK_NAME, TINYDOCKER_DEFAULT_NETWORK_CIDR, "bridge");
+    } else {
+        struct td_network_record existing;
+        if (read_network_info(TINYDOCKER_DEFAULT_NETWORK_NAME, &existing) != 0 ||
+            strcmp(existing.driver, "bridge") != 0 ||
+            strcmp(existing.cidr, TINYDOCKER_DEFAULT_NETWORK_CIDR) != 0) {
+            log_error("refusing to adopt an existing default bridge without matching metadata");
+            return -1;
+        }
     }
 
     //存在无论如何都启动一把
@@ -285,6 +417,11 @@ int create_default_bridge(void) {
 
 
 int delte_network(char *name) {
+    struct td_network_record owned_network;
+    if (read_network_info(name, &owned_network) != 0) {
+        log_error("refusing to delete untracked network interface: %s", name);
+        return -1;
+    }
     if (if_nametoindex(name) != 0U) {
         char *const set_down[] = {"ip", "link", "set", "dev", name,
                                   "down", NULL};
@@ -320,98 +457,128 @@ void get_first_cidr_host_ip(char *cidr_network, char *cidr_host_ip, int size) {
 }
 
 unsigned alloc_new_ip(char *name, char *ip, int buf_size) {
-    struct network nw;
-    if (read_network_info(name, &nw) == -1) {
-        log_error("failed to read newwork info of %s", name);
-        return 0;
-    }
+    struct td_network_record records[TD_NETWORK_MAX_RECORDS];
+    size_t count = 0U;
+    struct td_network_record *network = NULL;
+    unsigned int minimum;
+    unsigned int maximum;
+    unsigned int allocated = 0U;
+    int lock_fd;
 
-    unsigned int minIP;
-    unsigned int maxIP;
-    if (get_cidr_range(nw.cidr, &minIP, &maxIP, NULL) != 0) {
-        return 0;
+    if (name == NULL || ip == NULL || buf_size <= 0) {
+        return 0U;
     }
-    //分配IP地址ID时候排除最小的IP和最大的IP和已经被分配的IP
-    unsigned int_ip = 0;
-    for (unsigned i = minIP + 2; i < maxIP - 1; i++) { //加2开始时为了避免分配主机号0,1和255, 1是这里被设置为网桥地址
-        int used = 0;
-        for (int j = 0; j < nw.used_ip_cnt; j++) {
-            if (i == nw.used_ips[j]) {
-                used = 1;
-            }
-        }
-        if (used == 0) {
-            int_ip = i;
+    lock_fd = lock_network_state();
+    if (lock_fd < 0) {
+        return 0U;
+    }
+    if (load_network_records(records, TD_NETWORK_MAX_RECORDS, &count) != 0) {
+        goto cleanup;
+    }
+    for (size_t index = 0U; index < count; index++) {
+        if (strcmp(records[index].name, name) == 0) {
+            network = &records[index];
             break;
         }
     }
-
-    nw.used_ips[nw.used_ip_cnt++] = int_ip;
-    if (update_network_info(&nw) == -1) {
-        log_info("failed to update network info: %s", nw.name);
+    if (network == NULL || network->used_ip_count >= TD_NETWORK_MAX_USED_IPS ||
+        get_cidr_range(network->cidr, &minimum, &maximum, NULL) != 0 ||
+        maximum <= minimum + 2U) {
+        goto cleanup;
     }
-    
-    if (int_ip > 0) { //如果拿到了有效IP, 那么就做地址转换
-        int_to_str_ip(int_ip, ip, buf_size);
+    for (unsigned int candidate = minimum + 2U; candidate < maximum; candidate++) {
+        int used = 0;
+        for (size_t index = 0U; index < network->used_ip_count; index++) {
+            if (candidate == network->used_ips[index]) {
+                used = 1;
+                break;
+            }
+        }
+        if (used == 0) {
+            allocated = candidate;
+            break;
+        }
     }
+    if (allocated == 0U) {
+        goto cleanup;
+    }
+    network->used_ips[network->used_ip_count++] = allocated;
+    if (write_network_records(records, count) != 0) {
+        allocated = 0U;
+        goto cleanup;
+    }
+    int_to_str_ip(allocated, ip, buf_size);
 
-    return int_ip;
+cleanup:
+    (void)close(lock_fd);
+    return allocated;
 }
 
 
 int release_used_ip(char *name, char *ip) {
-    struct network nw;
-    if (read_network_info(name, &nw) == -1) {
-        log_error("failed to read network info of %s", name);
+    struct td_network_record records[TD_NETWORK_MAX_RECORDS];
+    size_t count = 0U;
+    unsigned int address = str_ip_to_int(ip);
+    int lock_fd;
+    int result = -1;
+
+    if (name == NULL || address == 0U) {
         return -1;
     }
-
-    if (nw.used_ip_cnt < 0) {
+    lock_fd = lock_network_state();
+    if (lock_fd < 0) {
         return -1;
     }
-    unsigned *old_ips = malloc(sizeof(unsigned) * (size_t)nw.used_ip_cnt);
-    for (int i = 0; i < nw.used_ip_cnt; i++) {
-        old_ips[i] = nw.used_ips[i];
+    if (load_network_records(records, TD_NETWORK_MAX_RECORDS, &count) != 0) {
+        goto cleanup;
     }
-
-    unsigned int_ip = str_ip_to_int(ip);
-    int new_size = 0;
-    for (int i = 0; i < nw.used_ip_cnt; i++) {
-        if (old_ips[i] != int_ip) {  //回写是排除当前释放的IP地址
-            nw.used_ips[new_size++] = old_ips[i];
+    for (size_t record_index = 0U; record_index < count; record_index++) {
+        struct td_network_record *network = &records[record_index];
+        if (strcmp(network->name, name) == 0) {
+            size_t output_index = 0U;
+            for (size_t ip_index = 0U; ip_index < network->used_ip_count;
+                 ip_index++) {
+                if (network->used_ips[ip_index] != address) {
+                    network->used_ips[output_index++] = network->used_ips[ip_index];
+                }
+            }
+            network->used_ip_count = output_index;
+            result = write_network_records(records, count);
+            goto cleanup;
         }
     }
-    nw.used_ip_cnt = new_size;
+    errno = ENOENT;
 
-    free(old_ips);
-
-    int ret = update_network_info(&nw);
-    if (ret == -1) {
-        log_info("failed to update network info: %s", nw.name);
-    }
-    
-    return ret;
+cleanup:
+    (void)close(lock_fd);
+    return result;
 }
 
 
 int list_network(void) {
-    struct network nw_buffer[100];
-    int cnt = get_network_list(nw_buffer, 100);
-    if (cnt < 0) {
+    struct td_network_record networks[TD_NETWORK_MAX_RECORDS];
+    size_t count = 0U;
+    if (load_network_records(networks, TD_NETWORK_MAX_RECORDS, &count) != 0) {
         return -1;
     }
     printf("%-10s\t%s\t%-18s\t%s\n", "NAME", "DRIVER", "CIDR", "ALLOC_IPS");
-    for (int i = 0; i < cnt; i++) {
-        printf("%-10s\t%s\t%-18s\t", nw_buffer[i].name, nw_buffer[i].driver, nw_buffer[i].cidr);
+    for (size_t index = 0U; index < count; index++) {
+        printf("%-10s\t%s\t%-18s\t", networks[index].name,
+               networks[index].driver, networks[index].cidr);
         char ips[4096] = {0};
-        for (int j = 0; j < nw_buffer[i].used_ip_cnt; j++) {
+        size_t used = 0U;
+        for (size_t ip_index = 0U; ip_index < networks[index].used_ip_count;
+             ip_index++) {
             char str_ips[64] = {0};
-            int_to_str_ip(nw_buffer[i].used_ips[j], str_ips, 64);
-            strcat(ips, str_ips);
-            strcat(ips, ",");
+            int_to_str_ip(networks[index].used_ips[ip_index], str_ips, 64);
+            int written = snprintf(ips + used, sizeof(ips) - used, "%s,", str_ips);
+            if (written < 0 || (size_t)written >= sizeof(ips) - used) {
+                return -1;
+            }
+            used += (size_t)written;
         }
-        if (strlen(ips) == 0) {
-            strcpy(ips, "NULL");
+        if (used == 0U) {
+            (void)snprintf(ips, sizeof(ips), "NULL");
         }
         printf("%s\n", ips);
     }
@@ -443,30 +610,37 @@ int connect_container(char *container_name, char *network, char *ip_addr) {
                                              sizeof(pid_list) / sizeof(pid_list[0]));
     if (pid_cnt <= 0) {
         log_error("failed to get container process list");
+        (void)release_used_ip(network, str_ip);
         return -1;
     }
     //默认第一个进程为1号进程, 可能不准, 但是在我们这个简单环境下基本都是它了
     int one_pid = pid_list[0];
 
 
-    //生成veth的名字
+    // 两端在宿主 namespace 创建时都使用唯一名字；移动后才重命名为 eth0。
     char *veth_container = "eth0";
     char veth_host[16] = {0};
+    char veth_peer[16] = {0};
     char pid_text[32] = {0};
     char container_address[64] = {0};
     if (td_make_veth_name(container_name, veth_host, sizeof(veth_host)) != 0 ||
+        td_make_veth_peer_name(container_name, veth_peer,
+                               sizeof(veth_peer)) != 0 ||
         snprintf(pid_text, sizeof(pid_text), "%d", one_pid) < 0 ||
         snprintf(container_address, sizeof(container_address), "%s/24", str_ip) < 0) {
         (void)release_used_ip(network, str_ip);
         return -1;
     }
 
-    char *const add_veth[] = {"ip", "link", "add", veth_container, "type",
+    char *const add_veth[] = {"ip", "link", "add", veth_peer, "type",
                               "veth", "peer", "name", veth_host, NULL};
     char *const add_to_bridge[] = {"brctl", "addif", network, veth_host, NULL};
     char *const host_up[] = {"ip", "link", "set", veth_host, "up", NULL};
-    char *const move_peer[] = {"ip", "link", "set", "dev", veth_container,
+    char *const move_peer[] = {"ip", "link", "set", "dev", veth_peer,
                                "netns", pid_text, NULL};
+    char *const rename_peer[] = {"nsenter", "-t", pid_text, "-n", "ip",
+                                 "link", "set", veth_peer, "name",
+                                 veth_container, NULL};
     char *const add_loopback[] = {"nsenter", "-t", pid_text, "-n", "ip",
                                   "addr", "add", "127.0.0.1/8", "dev", "lo", NULL};
     char *const loopback_up[] = {"nsenter", "-t", pid_text, "-n", "ip",
@@ -484,6 +658,7 @@ int connect_container(char *container_name, char *network, char *ip_addr) {
         td_run_command(add_to_bridge) != 0 ||
         td_run_command(host_up) != 0 ||
         td_run_command(move_peer) != 0 ||
+        td_run_command(rename_peer) != 0 ||
         td_run_command(add_loopback) != 0 ||
         td_run_command(loopback_up) != 0 ||
         td_run_command(add_address) != 0 ||
@@ -496,7 +671,7 @@ int connect_container(char *container_name, char *network, char *ip_addr) {
         return -1;
     }
 
-    strcpy(ip_addr, str_ip);
+    (void)snprintf(ip_addr, 20U, "%s", str_ip);
     return 0;
 }
 

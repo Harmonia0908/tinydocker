@@ -13,6 +13,7 @@
 
 #include "../core/cgroup_parse.h"
 #include "../core/fs.h"
+#include "../core/network_state.h"
 #include "../core/process.h"
 #include "../core/safety.h"
 #include "../core/status_codec.h"
@@ -86,17 +87,75 @@ static void test_safe_paths(void)
 
     char first_veth[16] = {0};
     char second_veth[16] = {0};
+    char peer_veth[16] = {0};
     CHECK(td_make_veth_name("same-prefix-container-a", first_veth,
                             sizeof(first_veth)) == 0);
     CHECK(td_make_veth_name("same-prefix-container-b", second_veth,
                             sizeof(second_veth)) == 0);
     CHECK(strlen(first_veth) <= 15U);
     CHECK(strcmp(first_veth, second_veth) != 0);
+    CHECK(td_make_veth_peer_name("same-prefix-container-a", peer_veth,
+                                 sizeof(peer_veth)) == 0);
+    CHECK(strlen(peer_veth) <= 15U);
+    CHECK(strcmp(first_veth, peer_veth) != 0);
     CHECK(td_archive_entry_is_safe("usr/bin/tool") == 1);
     CHECK(td_archive_entry_is_safe("./usr/bin/tool") == 1);
     CHECK(td_archive_entry_is_safe("../host") == 0);
     CHECK(td_archive_entry_is_safe("usr/../../host") == 0);
     CHECK(td_archive_entry_is_safe("/absolute/path") == 0);
+}
+
+static void test_network_state_codec(void)
+{
+    const char *valid = "tdnet:bridge:172.18.0.0/24:2886860802;2886860803;";
+    struct td_network_record record;
+    struct td_network_record round_trip;
+    char output[4096] = {0};
+    char oversized[4096] = "many:bridge:10.0.0.0/24:";
+    char error[160] = {0};
+
+    CHECK(td_parse_network_record(valid, &record, error, sizeof(error)) == 0);
+    CHECK(strcmp(record.name, "tdnet") == 0);
+    CHECK(strcmp(record.driver, "bridge") == 0);
+    CHECK(record.used_ip_count == 2U);
+    CHECK(td_format_network_record(&record, output, sizeof(output), error,
+                                   sizeof(error)) == 0);
+    CHECK(strcmp(output, valid) == 0);
+    CHECK(td_parse_network_record(output, &round_trip, error,
+                                  sizeof(error)) == 0);
+    CHECK(round_trip.used_ip_count == record.used_ip_count);
+    CHECK(td_parse_network_record("missing:bridge:172.18.0.0/24", &record,
+                                  error, sizeof(error)) == -1);
+    CHECK(strstr(error, "missing") != NULL);
+    CHECK(td_parse_network_record("bad:bridge:172.18.0.1/24:", &record,
+                                  error, sizeof(error)) == -1);
+    CHECK(strstr(error, "network address") != NULL);
+    CHECK(td_parse_network_record("bad:bridge:172.18.0.0/31:", &record,
+                                  error, sizeof(error)) == -1);
+    CHECK(td_parse_network_record("bad:bridge:172.18.0.0/24:not-a-number;",
+                                  &record, error, sizeof(error)) == -1);
+    CHECK(td_parse_network_record("bad:bridge:172.18.0.0/24:42;42;", &record,
+                                  error, sizeof(error)) == -1);
+    CHECK(td_parse_network_record("name-that-is-too-long:bridge:172.18.0.0/24:",
+                                  &record, error, sizeof(error)) == -1);
+    for (unsigned int index = 1U; index <= TD_NETWORK_MAX_USED_IPS + 1U;
+         index++) {
+        size_t used = strlen(oversized);
+        int written = snprintf(oversized + used, sizeof(oversized) - used,
+                               "%u;", index);
+        CHECK(written > 0 && (size_t)written < sizeof(oversized) - used);
+    }
+    CHECK(td_parse_network_record(oversized, &record, error,
+                                  sizeof(error)) == -1);
+    CHECK(strstr(error, "too many") != NULL);
+
+    memset(&record, 0, sizeof(record));
+    (void)snprintf(record.name, sizeof(record.name), "empty");
+    (void)snprintf(record.driver, sizeof(record.driver), "bridge");
+    (void)snprintf(record.cidr, sizeof(record.cidr), "10.0.0.0/24");
+    CHECK(td_format_network_record(&record, output, sizeof(output), error,
+                                   sizeof(error)) == 0);
+    CHECK(strcmp(output, "empty:bridge:10.0.0.0/24:") == 0);
 }
 
 static void test_cidr_and_cgroup_parsing(void)
@@ -296,6 +355,7 @@ int main(void)
     test_numeric_and_port_parsing();
     test_safe_paths();
     test_cidr_and_cgroup_parsing();
+    test_network_state_codec();
     test_proc_stat_parser();
     test_status_codec();
     test_cleanup_idempotency();
