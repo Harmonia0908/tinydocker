@@ -162,7 +162,6 @@ stop_and_remove_container() {
 
     step "Remove: remove container runtime artifacts"
     run_capture "$TMP_DIR/rm.out" "$TD" rm "$NAME"
-    CONTAINER_OWNED=0
 }
 
 verify_cleanup() {
@@ -184,6 +183,7 @@ verify_cleanup() {
 
     if [ "$dirty" -eq 0 ]; then
         info "no demo metadata/cgroup/workspace leftovers detected"
+        CONTAINER_OWNED=0
     else
         fail "demo cleanup left known artifacts; refusing direct rm/umount fallback" \
              "inspect the listed paths in the disposable VM before manual cleanup"

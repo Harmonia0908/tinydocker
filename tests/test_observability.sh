@@ -118,5 +118,8 @@ assert_contains "$TMP_DIR/ps-a.out" "$NAME" "ps -a should include the test conta
 assert_contains "$TMP_DIR/ps-a.out" "EXITED" "ps -a should show EXITED after lazy refresh"
 
 "$TD" rm "$NAME" >/dev/null
+if "$TD" inspect "$NAME" >/dev/null 2>&1; then
+    fail "removed container still has metadata: $NAME"
+fi
 CONTAINER_OWNED=0
 log "observability test passed"

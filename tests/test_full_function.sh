@@ -159,7 +159,6 @@ assert_file_contains "$TMP_ROOT/network-list.out" "$NET" "network ls should incl
 ip addr show "$NET" | grep '172.18.0.1/24' >/dev/null || fail "bridge should have expected cidr host ip"
 brctl show | grep "$NET" >/dev/null || fail "brctl should include created bridge"
 "$TD" network rm "$NET" > "$TMP_ROOT/network-rm.out" 2>&1
-NET_OWNED=0
 if grep -q "failed update network info" "$TMP_ROOT/network-rm.out"; then
     cat "$TMP_ROOT/network-rm.out" >&2
     fail "network rm should not falsely report failed update network info"
@@ -167,6 +166,7 @@ fi
 if brctl show | grep "$NET" >/dev/null; then
     fail "brctl should not include removed bridge"
 fi
+NET_OWNED=0
 
 log "check port mapping"
 C3_OWNED=1
@@ -194,12 +194,12 @@ tar -tf "$COMMIT_TAR" | grep "commit-marker" >/dev/null || fail "commit tar shou
 log "check stop/rm"
 "$TD" stop "$C1" "$C3" "$C4" >/dev/null 2>&1 || true
 run "$TD" rm "$C1" "$C2" "$C3" "$C4"
+if "$TD" ps -a | grep -E "$C1|$C2|$C3|$C4" >/dev/null; then
+    fail "removed test containers should not appear in ps -a"
+fi
 C1_OWNED=0
 C2_OWNED=0
 C3_OWNED=0
 C4_OWNED=0
-if "$TD" ps -a | grep -E "$C1|$C2|$C3|$C4" >/dev/null; then
-    fail "removed test containers should not appear in ps -a"
-fi
 
 log "full function test passed"
