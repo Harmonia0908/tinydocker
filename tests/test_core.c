@@ -49,6 +49,9 @@ static void test_numeric_and_port_parsing(void)
     long value = 0;
     int host_port = 0;
     int container_port = 0;
+    char host_path[128] = {0};
+    char container_path[128] = {0};
+    int read_only = -1;
 
     CHECK(td_parse_long("20000", 1000, 100000, &value, error, sizeof(error)) == 0);
     CHECK(value == 20000);
@@ -64,6 +67,32 @@ static void test_numeric_and_port_parsing(void)
                                 error, sizeof(error)) == -1);
     CHECK(td_parse_port_mapping("80:90:100", &host_port, &container_port,
                                 error, sizeof(error)) == -1);
+    CHECK(td_parse_volume_spec("/tmp/data:/var/lib/data:ro", host_path,
+                               sizeof(host_path), container_path,
+                               sizeof(container_path), &read_only,
+                               error, sizeof(error)) == 0);
+    CHECK(strcmp(host_path, "/tmp/data") == 0);
+    CHECK(strcmp(container_path, "/var/lib/data") == 0);
+    CHECK(read_only == 1);
+    CHECK(td_parse_volume_spec("relative:/data", host_path,
+                               sizeof(host_path), container_path,
+                               sizeof(container_path), &read_only,
+                               error, sizeof(error)) == -1);
+    CHECK(strstr(error, "absolute") != NULL);
+    CHECK(td_parse_volume_spec("/tmp/data:/../../host", host_path,
+                               sizeof(host_path), container_path,
+                               sizeof(container_path), &read_only,
+                               error, sizeof(error)) == -1);
+    CHECK(strstr(error, "traversal") != NULL);
+    CHECK(td_parse_volume_spec("/tmp/data:/data:execute", host_path,
+                               sizeof(host_path), container_path,
+                               sizeof(container_path), &read_only,
+                               error, sizeof(error)) == -1);
+    CHECK(strstr(error, "mode") != NULL);
+    CHECK(td_parse_volume_spec("/tmp/data:/data:ro:extra", host_path,
+                               sizeof(host_path), container_path,
+                               sizeof(container_path), &read_only,
+                               error, sizeof(error)) == -1);
 }
 
 static void test_safe_paths(void)

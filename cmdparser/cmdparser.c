@@ -58,55 +58,13 @@ static const struct argp_option docker_run_option_setting[] = {
 
 struct volume_config parse_volume_config(const char *input) {
     struct volume_config result;
-    char path_check[TINYDOCKER_MAX_VOLUME_PATH + 16] = {0};
     char error[160] = {0};
-    const char *first_separator;
-    const char *second_separator;
-    size_t host_length;
-    size_t container_length;
 
     memset(&result, 0, sizeof(result));
     result.ro = -1;
-    if (input == NULL) {
-        return result;
-    }
-    first_separator = strchr(input, ':');
-    if (first_separator == NULL || first_separator == input ||
-        first_separator[1] == '\0') {
-        return result;
-    }
-    second_separator = strchr(first_separator + 1, ':');
-    if (second_separator != NULL && strchr(second_separator + 1, ':') != NULL) {
-        return result;
-    }
-    host_length = (size_t)(first_separator - input);
-    container_length = second_separator == NULL ? strlen(first_separator + 1) :
-        (size_t)(second_separator - first_separator - 1);
-    if (host_length == 0U || container_length == 0U ||
-        host_length >= sizeof(result.host) ||
-        container_length >= sizeof(result.container)) {
-        return result;
-    }
-    memcpy(result.host, input, host_length);
-    memcpy(result.container, first_separator + 1, container_length);
-    if (result.host[0] != '/' ||
-        td_join_rootfs_path("/rootfs", result.container, path_check,
-                            sizeof(path_check), error, sizeof(error)) != 0) {
-        return result;
-    }
-    result.ro = 0;
-    if (second_separator != NULL) {
-        const char *mode = second_separator + 1;
-
-        if (strcmp(mode, "ro") == 0) {
-            result.ro = 1;
-        } else if (strcmp(mode, "rw") != 0) {
-            result.ro = -1;
-        }
-    }
-    if (strchr(result.host, '\n') != NULL || strchr(result.host, '\r') != NULL) {
-        result.ro = -1;
-    }
+    (void)td_parse_volume_spec(input, result.host, sizeof(result.host),
+                               result.container, sizeof(result.container),
+                               &result.ro, error, sizeof(error));
     return result;
 }
 

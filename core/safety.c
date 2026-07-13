@@ -120,6 +120,69 @@ int td_parse_port_mapping(const char *text, int *host_port, int *container_port,
     return 0;
 }
 
+int td_parse_volume_spec(const char *text, char *host, size_t host_size,
+                         char *container, size_t container_size, int *read_only,
+                         char *error, size_t error_size)
+{
+    const char *first_separator;
+    const char *second_separator;
+    size_t host_length;
+    size_t container_length;
+    char checked_path[4096] = {0};
+    int parsed_read_only = 0;
+
+    if (text == NULL || host == NULL || host_size == 0U || container == NULL ||
+        container_size == 0U || read_only == NULL) {
+        set_error(error, error_size, "invalid volume specification input");
+        return -1;
+    }
+    first_separator = strchr(text, ':');
+    if (first_separator == NULL || first_separator == text ||
+        first_separator[1] == '\0') {
+        set_error(error, error_size,
+                  "volume must use host:container[:ro|rw] form");
+        return -1;
+    }
+    second_separator = strchr(first_separator + 1, ':');
+    if (second_separator != NULL && strchr(second_separator + 1, ':') != NULL) {
+        set_error(error, error_size, "volume has too many fields");
+        return -1;
+    }
+    host_length = (size_t)(first_separator - text);
+    container_length = second_separator == NULL ? strlen(first_separator + 1) :
+        (size_t)(second_separator - first_separator - 1);
+    if (host_length == 0U || host_length >= host_size ||
+        container_length == 0U || container_length >= container_size) {
+        set_error(error, error_size, "volume path is empty or too long");
+        return -1;
+    }
+    memcpy(host, text, host_length);
+    host[host_length] = '\0';
+    memcpy(container, first_separator + 1, container_length);
+    container[container_length] = '\0';
+    if (host[0] != '/' || strchr(host, '\n') != NULL ||
+        strchr(host, '\r') != NULL) {
+        set_error(error, error_size,
+                  "volume host path must be an absolute single-line path");
+        return -1;
+    }
+    if (td_join_rootfs_path("/rootfs", container, checked_path,
+                            sizeof(checked_path), error, error_size) != 0) {
+        return -1;
+    }
+    if (second_separator != NULL) {
+        const char *mode = second_separator + 1;
+        if (strcmp(mode, "ro") == 0) {
+            parsed_read_only = 1;
+        } else if (strcmp(mode, "rw") != 0) {
+            set_error(error, error_size, "volume mode must be ro or rw");
+            return -1;
+        }
+    }
+    *read_only = parsed_read_only;
+    return 0;
+}
+
 int td_parse_ipv4_cidr(const char *text, uint32_t *network, unsigned int *prefix,
                        char *error, size_t error_size)
 {

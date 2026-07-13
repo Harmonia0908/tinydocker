@@ -10,6 +10,9 @@ int td_parse_long(const char *text, long minimum, long maximum, long *value,
                   char *error, size_t error_size);
 int td_parse_port_mapping(const char *text, int *host_port, int *container_port,
                           char *error, size_t error_size);
+int td_parse_volume_spec(const char *text, char *host, size_t host_size,
+                         char *container, size_t container_size, int *read_only,
+                         char *error, size_t error_size);
 int td_parse_ipv4_cidr(const char *text, uint32_t *network, unsigned int *prefix,
                        char *error, size_t error_size);
 int td_build_named_path(const char *base, const char *directory, const char *name,
