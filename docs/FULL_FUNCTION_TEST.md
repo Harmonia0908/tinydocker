@@ -9,8 +9,9 @@ Use a disposable VM with a recoverable snapshot. Do not run these tests on a wor
 - The scripts refuse to run unless `TINYDOCKER_ALLOW_PRIVILEGED_TESTS=1` is set.
 - They require an already-root shell and never invoke `sudo`.
 - Exactly one suite must be selected through `PRIVILEGED_SUITE`.
-- Each run generates unique container/network names and a unique `/tmp/tinydocker-*.XXXXXX` directory.
-- Cleanup calls tinydocker only for those generated names, then removes only that unique temporary directory.
+- Each run derives unique container/network names from its private `mktemp` directory and refuses externally supplied run IDs.
+- Before mutation, the scripts verify that every generated runtime name is absent.
+- Cleanup calls tinydocker only for resources marked as owned by the current run, then removes only that unique temporary directory.
 - The scripts do not scan or bulk-delete `/sys/fs/cgroup`, `/var/run`, mountpoints, network devices or unrelated runtime state.
 - A failed cleanup is reported; the scripts do not fall back to broad `kill`, `umount` or `rm -rf` commands.
 

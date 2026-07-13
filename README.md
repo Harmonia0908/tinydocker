@@ -46,7 +46,7 @@ flowchart TD
 | Namespace | UTS、PID、mount、network、IPC；`exec` 使用 namespace fd + `setns()` | user namespace、time namespace、完整 id mapping |
 | 文件系统 | 单 lowerdir OverlayFS、upper/work/mountpoint、bind volume、只读 remount、`pivot_root`、独立 `/proc` | OCI rootfs、多个镜像 layer metadata、完整 archive/symlink 恶意输入防护、只读 rootfs 策略 |
 | cgroup v2 | v2 检测、容器 cgroup 创建、`cpu.max`、`memory.max`、`cgroup.procs`、CPU/memory/pids stats | 自动启用父级 controller、`pids.max` 配置、systemd/DBus 管理、delegation、压力指标 |
-| 网络 | bridge、veth、容器地址/默认路由、OUTPUT/PREROUTING DNAT、MASQUERADE | CNI、IPv6、DNS、网络 namespace 持久化、策略隔离 |
+| 网络 | bridge、唯一 veth pair、容器地址/默认路由、OUTPUT/PREROUTING DNAT、MASQUERADE；网络状态严格解析、writer lock + 原子替换 | CNI、IPv6、DNS、网络 namespace 持久化、策略隔离 |
 | 生命周期 | run、ps、inspect、stats、top、exec、stop、rm、commit、network create/ls/rm | daemon、restart policy、checkpoint/restore、健康检查 |
 | 安全 | 名称/路径/数值/CIDR 校验、无 shell 命令构造、metadata `O_NOFOLLOW` + 原子 rename、PID start-time 校验、保守 cleanup | seccomp、LSM、capability drop、rootless、签名镜像、生产级并发与审计 |
 
@@ -126,11 +126,13 @@ make check         # 依次执行以上三项
 
 - 容器名与保留路径组件校验
 - 严格整数、端口和 IPv4 CIDR 解析
+- volume `host:container[:ro|rw]` 配置解析与路径穿越拒绝
 - runtime 路径与 rootfs 内路径生成
 - symlink 下的安全目录创建
 - cgroup stat、byte value 和 `cgroup.procs` 解析
 - `/proc/<pid>/stat` start time 解析
 - metadata 严格解析、错误信息和读写 round-trip
+- network state 严格解析、容量/重复 IP/CIDR 边界和读写 round-trip
 - archive entry 基础路径穿越检查
 - cleanup 缺失资源幂等性
 - 无 shell 的子进程执行与输出捕获
@@ -140,7 +142,7 @@ GitHub Actions 默认只运行 Linux build、非特权测试、严格静态编�
 
 ## 特权集成测试
 
-特权测试会修改 namespace、mount、cgroup、veth/bridge 和 iptables。它们默认拒绝执行，不会自动调用 `sudo`，并要求已经处于可丢弃 Linux VM 的 root shell。测试使用唯一容器名、网络名和 `/tmp/tinydocker-*.XXXXXX` 目录；cleanup 只引用本次生成的名称。
+特权测试会修改 namespace、mount、cgroup、veth/bridge 和 iptables。它们默认拒绝执行，不会自动调用 `sudo`，并要求已经处于可丢弃 Linux VM 的 root shell。测试从 `mktemp` 目录后缀生成唯一容器名和网络名，先只读确认名称不存在，随后只清理由本次流程标记为 owned 的资源；不接受外部指定测试 run ID。
 
 审查脚本后，显式选择一个 suite：
 
@@ -201,7 +203,7 @@ TINYDOCKER_ALLOW_PRIVILEGED_DEMO=1 bash demo.sh
 - metadata 原子更新避免半写文件，但没有跨所有命令的事务锁；并发 lifecycle 操作仍可能产生逻辑竞争。
 - PID start time 大幅降低 PID reuse 误判，但 signal 前仍存在很窄的检查/使用竞争；没有使用 pidfd 完成全程身份绑定。
 - cgroup parent、controller delegation 和 systemd 交互依赖宿主配置；本项目不自动修复宿主层级。
-- 网络 metadata 仍是简化文本文件，端口映射没有持久化到容器 metadata。
+- 网络 metadata 仍是简化文本格式；虽然已有严格 codec、`O_NOFOLLOW`、writer lock 和原子替换，但宿主 bridge/veth/iptables 变化与文件更新不是单个事务。端口映射没有持久化到容器 metadata。
 - `commit` 是 mountpoint 的 tar 快照，不是 OCI image，也不保存运行配置或网络配置。
 
 ## 已知限制
