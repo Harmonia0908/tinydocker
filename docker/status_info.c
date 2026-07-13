@@ -12,6 +12,12 @@
 #include "../cmdparser/cmdparser.h"
 #include "container.h"
 #include "status_info.h"
+#include "../core/safety.h"
+#include "../core/status_codec.h"
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 
 char *str_status[] = {"RUNNING", "STOPPED", "EXITED"};
@@ -59,21 +65,43 @@ static int append_string_field(char *dst, size_t dst_size, const char *src, cons
     return 0;
 }
 
-static int parse_int_field(const char *value, int *out) {
-    char *end = NULL;
-    long parsed = 0;
+static int read_process_start_time(pid_t pid, uint64_t *start_time) {
+    char path[64] = {0};
+    char stat_line[4096] = {0};
+    char error[160] = {0};
+    FILE *file;
+    int path_length;
+    unsigned long long parsed_start_time = 0;
 
-    if (value == NULL || out == NULL) {
+    if (pid <= 0 || start_time == NULL) {
+        errno = EINVAL;
         return -1;
     }
-
-    errno = 0;
-    parsed = strtol(value, &end, 10);
-    if (errno != 0 || end == value || *end != '\0' || parsed < INT_MIN || parsed > INT_MAX) {
+    path_length = snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    if (path_length < 0 || (size_t)path_length >= sizeof(path)) {
+        errno = ENAMETOOLONG;
         return -1;
     }
-
-    *out = (int) parsed;
+    file = fopen(path, "r");
+    if (file == NULL) {
+        return -1;
+    }
+    if (fgets(stat_line, sizeof(stat_line), file) == NULL) {
+        int saved_errno = errno == 0 ? EIO : errno;
+        (void)fclose(file);
+        errno = saved_errno;
+        return -1;
+    }
+    if (fclose(file) != 0) {
+        return -1;
+    }
+    if (td_parse_proc_stat_start_time(stat_line, &parsed_start_time,
+                                      error, sizeof(error)) != 0) {
+        log_warn("failed to parse process %d start time: %s", pid, error);
+        errno = EINVAL;
+        return -1;
+    }
+    *start_time = (uint64_t)parsed_start_time;
     return 0;
 }
 
@@ -105,6 +133,11 @@ int create_container_info(struct docker_run_arguments *args, int pid, enum conta
 
     memset(info, 0, sizeof(*info));
     info->pid = pid;
+    if (read_process_start_time(pid, &info->pid_start_time) != 0) {
+        log_error("failed to read start time for container process %d: %s",
+                  pid, strerror(errno));
+        return -1;
+    }
     info->detach = args->detach;
 
     int container_id_len = snprintf(info->container_id, sizeof(info->container_id), "%d", created_timestamp);
@@ -173,178 +206,183 @@ int create_container_info(struct docker_run_arguments *args, int pid, enum conta
 }
 
 int write_container_info(char *container_name, struct container_info *info) {
-    if (!path_exist(CONTAINER_STATUS_INFO_DIR)) {
-        make_path(CONTAINER_STATUS_INFO_DIR);
-    }
-    
-    char status_file_path[1024] = {0};
-    int path_len = snprintf(status_file_path, sizeof(status_file_path), "%s/%s", CONTAINER_STATUS_INFO_DIR, container_name);
-    if (path_len < 0 || (size_t) path_len >= sizeof(status_file_path)) {
-        log_error("container info path too long: %s", container_name);
+    char validation_error[160] = {0};
+    char temporary_name[256] = {0};
+    char final_path[1024] = {0};
+    int directory_fd = -1;
+    int metadata_fd = -1;
+    FILE *file = NULL;
+    int result = -1;
+
+    if (container_name == NULL || info == NULL ||
+        td_validate_name(container_name, TINYDOCKER_MAX_CONTAINER_NAME,
+                         validation_error, sizeof(validation_error)) != 0 ||
+        strcmp(container_name, info->name) != 0) {
+        log_error("invalid container metadata name: %s", validation_error);
         return -1;
     }
-
-    FILE *file = fopen(status_file_path, "w");
-    if (file == NULL) {
-        log_error("failed to open file: %s", status_file_path);
+    if (!path_exist(CONTAINER_STATUS_INFO_DIR) &&
+        make_path(CONTAINER_STATUS_INFO_DIR) != 0) {
+        log_error("failed to create container info directory: %s",
+                  CONTAINER_STATUS_INFO_DIR);
         return -1;
     }
-
-    int volume_cnt = info->volume_cnt;
-    int max_volumes = sizeof(info->volumes) / sizeof(info->volumes[0]);
-    if (volume_cnt < 0) {
-        log_warn("container %s has invalid volume_cnt %d, write as 0", container_name, volume_cnt);
-        volume_cnt = 0;
-    }
-    if (volume_cnt > max_volumes) {
-        log_warn("container %s volume_cnt %d exceeds limit %d, truncate", container_name, volume_cnt, max_volumes);
-        volume_cnt = max_volumes;
-    }
-
-    if (fprintf(file, "pid=%d\ndetach=%d\ncontainer_id=%s\nimage=%s\ncommand=%s\ncreated=%s\nstatus=%s\nip_addr=%s\nname=%s\nvolume_cnt=%d", \
-    info->pid, info->detach, info->container_id, info->image, info->command, info->created, info->status, info->ip_addr, info->name, volume_cnt) < 0) {
-        log_error("failed to write container info header: %s", status_file_path);
-        fclose(file);
+    directory_fd = open(CONTAINER_STATUS_INFO_DIR,
+                        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory_fd < 0) {
+        log_error("failed to safely open container info directory: %s",
+                  strerror(errno));
         return -1;
     }
-
-    for (int i = 0; i < volume_cnt; i++) {
-        if (fprintf(file, "\n%s", info->volumes[i]) < 0) {
-            log_error("failed to write container info volume: %s", status_file_path);
-            fclose(file);
-            return -1;
+    for (unsigned int attempt = 0; attempt < 100U; attempt++) {
+        int name_length = snprintf(temporary_name, sizeof(temporary_name),
+                                   ".%s.tmp.%ld.%u", container_name,
+                                   (long)getpid(), attempt);
+        if (name_length < 0 || (size_t)name_length >= sizeof(temporary_name)) {
+            log_error("temporary metadata path too long: %s", container_name);
+            goto cleanup;
+        }
+        metadata_fd = openat(directory_fd, temporary_name,
+                             O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                             S_IRUSR | S_IWUSR);
+        if (metadata_fd >= 0 || errno != EEXIST) {
+            break;
         }
     }
-
-    if (fclose(file) != 0) {
-        log_error("failed to close container info file: %s", status_file_path);
-        return -1;
+    if (metadata_fd < 0) {
+        log_error("failed to create temporary metadata for %s: %s",
+                  container_name, strerror(errno));
+        goto cleanup;
     }
+    file = fdopen(metadata_fd, "w");
+    if (file == NULL) {
+        log_error("failed to open metadata stream for %s: %s",
+                  container_name, strerror(errno));
+        goto cleanup;
+    }
+    metadata_fd = -1;
+    if (td_write_container_info(file, info, validation_error,
+                                sizeof(validation_error)) != 0 ||
+        fflush(file) != 0 || fsync(fileno(file)) != 0) {
+        log_error("failed to write metadata for %s: %s", container_name,
+                  validation_error[0] == '\0' ? strerror(errno) : validation_error);
+        goto cleanup;
+    }
+    if (fclose(file) != 0) {
+        file = NULL;
+        log_error("failed to close metadata for %s: %s",
+                  container_name, strerror(errno));
+        goto cleanup;
+    }
+    file = NULL;
+    if (renameat(directory_fd, temporary_name, directory_fd, container_name) != 0) {
+        log_error("failed to atomically publish metadata for %s: %s",
+                  container_name, strerror(errno));
+        goto cleanup;
+    }
+    result = 0;
 
-    log_info("write container info into %s", status_file_path);
-    return 0;
+cleanup:
+    if (file != NULL) {
+        (void)fclose(file);
+    } else if (metadata_fd >= 0) {
+        (void)close(metadata_fd);
+    }
+    if (result != 0 && temporary_name[0] != '\0') {
+        (void)unlinkat(directory_fd, temporary_name, 0);
+    }
+    (void)close(directory_fd);
+    if (snprintf(final_path, sizeof(final_path), "%s/%s",
+                 CONTAINER_STATUS_INFO_DIR, container_name) > 0 && result == 0) {
+        log_info("wrote container info atomically to %s", final_path);
+    }
+    return result;
 }
 
 int read_container_info(const char *container_name, struct container_info *info) {
-    char container_info_file[1024] = {0};
-    int path_len = snprintf(container_info_file, sizeof(container_info_file), "%s/%s", CONTAINER_STATUS_INFO_DIR, container_name);
-    if (path_len < 0 || (size_t) path_len >= sizeof(container_info_file)) {
-        log_error("container info path too long: %s", container_name);
+    enum { MAX_METADATA_SIZE = 1024 * 1024 };
+    char validation_error[160] = {0};
+    struct stat status;
+    char *data = NULL;
+    size_t offset = 0U;
+    int directory_fd = -1;
+    int metadata_fd = -1;
+    int result = -1;
+
+    if (info == NULL ||
+        td_validate_name(container_name, TINYDOCKER_MAX_CONTAINER_NAME,
+                         validation_error, sizeof(validation_error)) != 0) {
+        log_error("invalid container metadata name: %s", validation_error);
         return -1;
     }
-
-    FILE *file = fopen(container_info_file, "r");
-    if (file == NULL) {
-        log_error("failed to open container info file: %s", container_info_file);
-        return -1;
+    directory_fd = open(CONTAINER_STATUS_INFO_DIR,
+                        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory_fd < 0) {
+        log_error("failed to safely open container info directory: %s",
+                  strerror(errno));
+        goto cleanup;
     }
-    
-    memset(info, 0, sizeof(*info));
-    info->volume_cnt = -1;
-    int vol_idx = 0;
-    int max_volumes = sizeof(info->volumes) / sizeof(info->volumes[0]);
-
-    char line[1024];
-    while (fgets(line, sizeof(line), file) != NULL) {
-        // Remove newline character from the end of the line
-        line[strcspn(line, "\n")] = '\0';
-
-        if (info->volume_cnt != -1) {
-            if (vol_idx < max_volumes) {
-                if (copy_string_field(info->volumes[vol_idx], sizeof(info->volumes[vol_idx]), line, "volume") != 0) {
-                    log_warn("invalid volume in container info %s, ignore", container_name);
-                } else {
-                    vol_idx++;
-                }
-            } else {
-                log_warn("container %s has too many volume entries, ignore: %s", container_name, line);
-            }
+    metadata_fd = openat(directory_fd, container_name,
+                         O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (metadata_fd < 0) {
+        log_error("failed to safely open container info for %s: %s",
+                  container_name, strerror(errno));
+        goto cleanup;
+    }
+    if (fstat(metadata_fd, &status) != 0 || !S_ISREG(status.st_mode) ||
+        status.st_size < 0 || status.st_size > MAX_METADATA_SIZE) {
+        log_error("container info is not a safe regular file: %s", container_name);
+        goto cleanup;
+    }
+    data = malloc((size_t)status.st_size + 1U);
+    if (data == NULL) {
+        log_error("failed to allocate metadata buffer for %s", container_name);
+        goto cleanup;
+    }
+    while (offset < (size_t)status.st_size) {
+        ssize_t count = read(metadata_fd, data + offset,
+                             (size_t)status.st_size - offset);
+        if (count < 0 && errno == EINTR) {
             continue;
         }
-        // Split only on the first '=' so values such as command arguments can contain '='.
-        char *sep = strchr(line, '=');
-        if (sep == NULL) {
-            continue;
+        if (count <= 0) {
+            log_error("short read from container info: %s", container_name);
+            goto cleanup;
         }
-        *sep = '\0';
-        char *key = line;
-        char *value = sep + 1;
-
-        if (strcmp(key, "pid") == 0) {
-            if (parse_int_field(value, &info->pid) == -1) {
-                log_warn("invalid pid in container info %s: %s", container_name, value);
-                info->pid = -1;
-            }
-        }
-        if (strcmp(key, "detach") == 0) {
-            if (parse_int_field(value, &info->detach) == -1) {
-                log_warn("invalid detach in container info %s: %s", container_name, value);
-            }
-        }
-        if (strcmp(key, "container_id") == 0) {
-            if (copy_string_field(info->container_id, sizeof(info->container_id), value, "container_id") != 0) {
-                log_warn("invalid container_id in container info %s, ignore", container_name);
-            }
-        }
-        if (strcmp(key, "image") == 0) {
-            if (copy_string_field(info->image, sizeof(info->image), value, "image") != 0) {
-                log_warn("invalid image in container info %s, ignore", container_name);
-            }
-        }
-        if (strcmp(key, "command") == 0) {
-            if (copy_string_field(info->command, sizeof(info->command), value, "command") != 0) {
-                log_warn("invalid command in container info %s, ignore", container_name);
-            }
-        }
-        if (strcmp(key, "created") == 0) {
-            if (copy_string_field(info->created, sizeof(info->created), value, "created") != 0) {
-                log_warn("invalid created time in container info %s, ignore", container_name);
-            }
-        }
-        if (strcmp(key, "status") == 0) {
-            if (copy_string_field(info->status, sizeof(info->status), value, "status") != 0) {
-                log_warn("invalid status in container info %s, use UNKNOWN", container_name);
-                copy_string_field(info->status, sizeof(info->status), "UNKNOWN", "status");
-            }
-        }
-        if (strcmp(key, "ip_addr") == 0) {
-            if (copy_string_field(info->ip_addr, sizeof(info->ip_addr), value, "ip_addr") != 0) {
-                log_warn("invalid ip_addr in container info %s, ignore", container_name);
-            }
-        }
-        if (strcmp(key, "name") == 0) {
-            if (copy_string_field(info->name, sizeof(info->name), value, "name") != 0) {
-                log_warn("invalid name in container info %s, keep empty", container_name);
-            }
-        }
-        if (strcmp(key, "volume_cnt") == 0) {
-            if (parse_int_field(value, &info->volume_cnt) == -1 || info->volume_cnt < 0) {
-                log_warn("invalid volume_cnt in container info %s: %s", container_name, value);
-                info->volume_cnt = 0;
-            }
-            if (info->volume_cnt > max_volumes) {
-                log_warn("container %s volume_cnt %d exceeds limit %d", container_name, info->volume_cnt, max_volumes);
-                info->volume_cnt = max_volumes;
-            }
-        }
+        offset += (size_t)count;
     }
-    fclose(file);
-
-    if (info->volume_cnt == -1) {
-        info->volume_cnt = 0; //从头到位没有读到卷挂载信息, 恢复为0;
-    } else if (info->volume_cnt > vol_idx) {
-        info->volume_cnt = vol_idx;
+    if (td_parse_container_info(data, offset, container_name, info,
+                                validation_error, sizeof(validation_error)) != 0) {
+        log_error("corrupt container info %s: %s",
+                  container_name, validation_error);
+        goto cleanup;
     }
-    return 0;
+    result = 0;
+
+cleanup:
+    free(data);
+    if (metadata_fd >= 0) {
+        (void)close(metadata_fd);
+    }
+    if (directory_fd >= 0) {
+        (void)close(directory_fd);
+    }
+    return result;
 }
 
 int update_container_status(char *container_name, enum container_status status) {
     struct container_info info;
+    if (status < CONTAINER_RUNNING || status > CONTAINER_EXITED) {
+        log_error("invalid container status: %d", status);
+        return -1;
+    }
     if (read_container_info(container_name, &info) == -1) {
         log_error("failed load container info for %s", container_name);
         return -1;
     }
-    strcpy(info.status, str_status[status]);
+    if (snprintf(info.status, sizeof(info.status), "%s", str_status[status]) < 0) {
+        return -1;
+    }
     return write_container_info(container_name, &info);
 }
 
@@ -368,19 +406,33 @@ int refresh_container_status_if_needed(const char *container_name, struct contai
         return 0;
     }
 
-    char proc_path[128] = {0};
-    sprintf(proc_path, "/proc/%d", info->pid);
-    if (path_exist(proc_path)) {
-        return 0;
+    uint64_t current_start_time = 0;
+    if (read_process_start_time(info->pid, &current_start_time) == 0) {
+        if (info->pid_start_time == 0U) {
+            log_warn("container %s has legacy metadata without pid_start_time; "
+                     "PID reuse cannot be ruled out", container_name);
+            return 0;
+        }
+        if (current_start_time == info->pid_start_time) {
+            return 0;
+        }
+        log_warn("container %s pid %d was reused (start time changed)",
+                 container_name, info->pid);
+    } else if (errno != ENOENT && errno != ESRCH) {
+        log_warn("failed to verify container %s pid %d identity: %s",
+                 container_name, info->pid, strerror(errno));
+        return -1;
     }
 
-    strcpy(info->status, str_status[CONTAINER_EXITED]);
+    (void)snprintf(info->status, sizeof(info->status), "%s",
+                   str_status[CONTAINER_EXITED]);
     if (write_container_info((char *) container_name, info) != 0) {
         log_error("failed to update container %s status to EXITED", container_name);
         return -1;
     }
 
-    log_info("container %s pid %d not exists, mark status as EXITED", container_name, info->pid);
+    log_info("container %s pid %d is gone or reused; mark status as EXITED",
+             container_name, info->pid);
     return 1;
 }
 
@@ -404,6 +456,12 @@ int list_containers_info(struct container_info *container_info_list, size_t capa
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
             continue;
         }
+        char validation_error[160] = {0};
+        if (td_validate_name(entry->d_name, TINYDOCKER_MAX_CONTAINER_NAME,
+                             validation_error, sizeof(validation_error)) != 0) {
+            log_warn("skip unsafe container info entry: %s", validation_error);
+            continue;
+        }
 
         // Construct the absolute path of the file
         char file_path[PATH_MAX];
@@ -415,7 +473,7 @@ int list_containers_info(struct container_info *container_info_list, size_t capa
         //printf("%s\n", file_path);
         // Check if the entry is a file
         struct stat file_stat;
-        if (stat(file_path, &file_stat) == 0 && S_ISREG(file_stat.st_mode)) {
+        if (lstat(file_path, &file_stat) == 0 && S_ISREG(file_stat.st_mode)) {
             if (container_cnt >= capacity) {
                 log_warn("container info list capacity %zu reached, skip remaining entries", capacity);
                 break;
@@ -442,11 +500,24 @@ int list_containers_info(struct container_info *container_info_list, size_t capa
 
 
 int remove_status_info(char *container_name) {
-    char status_path[1024] = {0};
-    int path_len = snprintf(status_path, sizeof(status_path), "%s/container_info/%s", TINYDOCKER_RUNTIME_DIR, container_name);
-    if (path_len < 0 || (size_t) path_len >= sizeof(status_path)) {
-        log_error("container info path too long: %s", container_name);
+    char validation_error[160] = {0};
+    int directory_fd;
+    int result;
+
+    if (td_validate_name(container_name, TINYDOCKER_MAX_CONTAINER_NAME,
+                         validation_error, sizeof(validation_error)) != 0) {
+        log_error("invalid container info name: %s", validation_error);
         return -1;
     }
-    return remove(status_path);
+    directory_fd = open(CONTAINER_STATUS_INFO_DIR,
+                        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory_fd < 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    result = unlinkat(directory_fd, container_name, 0);
+    if (result != 0 && errno == ENOENT) {
+        result = 0;
+    }
+    (void)close(directory_fd);
+    return result;
 }

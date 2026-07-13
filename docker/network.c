@@ -421,7 +421,8 @@ int connect_container(char *container_name, char *network, char *ip_addr) {
     
     // 找出目标容器中的一个进程ID, 该进程用来寻找ns文件
     int pid_list[4096];
-    int pid_cnt = get_container_processes_id(container_name, pid_list);
+    int pid_cnt = get_container_processes_id(container_name, pid_list,
+                                             sizeof(pid_list) / sizeof(pid_list[0]));
     if (pid_cnt <= 0) {
         log_error("failed to get container process list");
         return -1;

@@ -5,14 +5,19 @@
 #include <dirent.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
+#include <sys/stat.h>
 #include "../util/utils.h"
 #include "../logger/log.h"
+#include "../core/safety.h"
+#include "../cmdparser/cmdparser.h"
+#include "cgroup.h"
 
 #define CGROUP_ROOT "/sys/fs/cgroup"
 #define TINYDOCKER_PREFIX "tinydocker"
-static char *cgroup_base = "/sys/fs/cgroup/system.slice";
+static const char cgroup_base[] = "/sys/fs/cgroup/system.slice";
 
-static int write_file(char *path, char *value) {
+static int write_file(const char *path, const char *value) {
     int fd = open(path, O_WRONLY|O_TRUNC);
     if (fd < 0) {
         log_error("failed to open cgroup file %s, err:%s", path, strerror(errno));
@@ -20,8 +25,19 @@ static int write_file(char *path, char *value) {
     }
 
     size_t value_len = strlen(value);
-    ssize_t written = write(fd, value, value_len);
-    int write_failed = written < 0 || (size_t) written != value_len;
+    size_t offset = 0U;
+    int write_failed = 0;
+    while (offset < value_len) {
+        ssize_t written = write(fd, value + offset, value_len - offset);
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
+            write_failed = 1;
+            break;
+        }
+        offset += (size_t)written;
+    }
     if (write_failed) {
         log_error("failed to write cgroup file %s, err:%s", path, strerror(errno));
     }
@@ -35,6 +51,12 @@ static int write_file(char *path, char *value) {
 }
 
 int get_container_cgroup_path(char *container_name, char *cgroup_path, size_t cgroup_path_size) {
+    char validation_error[160] = {0};
+    if (td_validate_name(container_name, TINYDOCKER_MAX_CONTAINER_NAME,
+                         validation_error, sizeof(validation_error)) != 0) {
+        log_error("invalid cgroup container name: %s", validation_error);
+        return -1;
+    }
     int ret = snprintf(cgroup_path, cgroup_path_size, "%s/%s-%s", cgroup_base, TINYDOCKER_PREFIX, container_name);
     if (ret < 0 || (size_t) ret >= cgroup_path_size) {
         log_error("container cgroup path too long: %s", container_name);
@@ -53,23 +75,28 @@ static int get_container_cgroup_file_path(char *container_name, char *file_name,
 }
 
 int write_pid_to_cgroup_procs(int pid, char *cgroup_procs_path) {    
-    int fd = open(cgroup_procs_path, O_WRONLY|O_APPEND);
-    if (fd < 0) {
-        log_error("failed to open cgroup file: %s", cgroup_procs_path);
+    if (pid <= 0 || cgroup_procs_path == NULL) {
+        log_error("invalid pid or cgroup.procs path");
         return -1;
     }
 
     char pid_str[100] = {0};
-    sprintf(pid_str, "%d\n", pid);
-    int ret = write(fd, pid_str, strlen(pid_str));
-    close(fd);
-    return ret < 0 ? -1 : 0;
+    int length = snprintf(pid_str, sizeof(pid_str), "%d\n", pid);
+    if (length < 0 || (size_t)length >= sizeof(pid_str)) {
+        return -1;
+    }
+    return write_file(cgroup_procs_path, pid_str);
 }
 
 int init_cgroup(char *container_name) {
+    if (!path_exist("/sys/fs/cgroup/cgroup.controllers")) {
+        log_error("cgroup v2 is not available at /sys/fs/cgroup");
+        return -1;
+    }
     if (!path_exist(cgroup_base)) {
-        log_error("cgroup_base: %s not exists, created it", cgroup_base);
-        make_path(cgroup_base);
+        log_error("cgroup parent does not exist: %s; refusing to create an "
+                  "unknown host cgroup hierarchy", cgroup_base);
+        return -1;
     }
 
     char cgroup_path[1024] = {0};
@@ -77,7 +104,7 @@ int init_cgroup(char *container_name) {
         return -1;
     }
     log_info("creating cgroup at: %s", cgroup_path);
-    int ret = make_path(cgroup_path);
+    int ret = mkdir(cgroup_path, S_IRWXU);
     if (ret == -1) {
         log_error("init cgroup error, failed to create %s", cgroup_path);
     }
@@ -89,10 +116,14 @@ int remove_cgroup(char *container_name) {
     if (get_container_cgroup_path(container_name, cgroup_path, sizeof(cgroup_path)) != 0) {
         return -1;
     }
-    return rmdir(cgroup_path);
+    if (rmdir(cgroup_path) == 0 || errno == ENOENT) {
+        return 0;
+    }
+    log_error("failed to remove cgroup %s: %s", cgroup_path, strerror(errno));
+    return -1;
 }
 
-int set_mem_limit(char *container_name, int mem_max) {
+static int set_mem_limit(char *container_name, int mem_max) {
     if (mem_max <= 0) {
         log_error("invalid mem_max value: %d", mem_max);
         return -1;
@@ -112,7 +143,7 @@ int set_mem_limit(char *container_name, int mem_max) {
 }
 
 
-int set_cpu_limit(char *container_name, int cpu_time) {
+static int set_cpu_limit(char *container_name, int cpu_time) {
     if (cpu_time < 1000) {
         log_error("invalid cpu.max value: %d", cpu_time);
         return -1;
@@ -132,7 +163,7 @@ int set_cpu_limit(char *container_name, int cpu_time) {
 }
 
 
-int set_cpuset_limit(char *container_name, char *cpus) {
+static int set_cpuset_limit(char *container_name, char *cpus) {
     if (cpus == NULL) {
         log_error("invalid cpuset.cpus value, can not be NULL");
         return -1;
@@ -183,7 +214,7 @@ int set_cgroup_limits(char *container_name, int cpu, int memory, char *cpuset) {
     return 0;
 }
 
-int get_container_processes_id(char *container_name, int *pid_list) {
+int get_container_processes_id(char *container_name, int *pid_list, size_t capacity) {
     char cgroup_procs_path[1024] = {0};
     if (get_container_cgroup_file_path(container_name, "cgroup.procs", cgroup_procs_path, sizeof(cgroup_procs_path)) != 0) {
         return -1;
@@ -199,11 +230,31 @@ int get_container_processes_id(char *container_name, int *pid_list) {
         return -1;
     }
 
+    if (pid_list == NULL || capacity == 0U) {
+        log_error("invalid cgroup pid output buffer");
+        (void)fclose(file);
+        return -1;
+    }
+
     char line[32];
     int pid_cnt = 0;
     while (fgets(line, sizeof(line), file)) {
-        strtok(line, "\n");  // 去除行尾的换行符
-        pid_list[pid_cnt++] = atoi(line); //转为整数
+        char error[160] = {0};
+        long parsed_pid = 0;
+        line[strcspn(line, "\n")] = '\0';
+        if (td_parse_long(line, 1, INT_MAX, &parsed_pid,
+                          error, sizeof(error)) != 0) {
+            log_error("invalid pid in %s: %s", cgroup_procs_path, error);
+            (void)fclose(file);
+            return -1;
+        }
+        if ((size_t)pid_cnt >= capacity) {
+            log_error("cgroup process list exceeds capacity %zu for %s",
+                      capacity, container_name);
+            (void)fclose(file);
+            return -1;
+        }
+        pid_list[pid_cnt++] = (int)parsed_pid;
     }
 
     fclose(file);
@@ -213,7 +264,7 @@ int get_container_processes_id(char *container_name, int *pid_list) {
 
 
 int get_cgroup_files(pid_t pid, char *cgroup_files[], int limit) {
-    const int MAX_BUF = 1024;
+    enum { MAX_BUF = 1024 };
     char path[MAX_BUF];
     snprintf(path, sizeof(path), "/proc/%d/cgroup", pid);
 
@@ -228,9 +279,9 @@ int get_cgroup_files(pid_t pid, char *cgroup_files[], int limit) {
     while (fgets(line, sizeof(line), file) != NULL && count < limit) {
         char *subsystem = NULL;
         char *cgroup_path = NULL;
-        char spliter_cnt = 0;
-        int len = strlen(line);
-        for (int i = 0; i < len; i++) {
+        int spliter_cnt = 0;
+        size_t len = strlen(line);
+        for (size_t i = 0U; i < len; i++) {
             if (line[i] == ':') {
                 spliter_cnt++;
                 line[i] = '\0';

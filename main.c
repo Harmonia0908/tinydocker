@@ -7,12 +7,13 @@
 
 int main(int argc, char **argv)
 {
-    // TODO: split global environment initialization by command type so read-only commands such as inspect/stats/ps do not trigger network initialization.
-    init_docker_env();
     struct docker_cmd result = parse_docker_cmd(argc, argv);
     switch (result.cmd_type)
     {
     case DOCKER_RUN:
+        if (init_docker_env() != 0) {
+            return EXIT_FAILURE;
+        }
         print_docker_cmds(result);
         docker_run(result.arguments);
         break;
@@ -47,6 +48,9 @@ int main(int argc, char **argv)
         docker_stats(result.arguments);
         break;
     case DOCKER_NETWORK_CREATE:
+        if (init_runtime_dirs() != 0) {
+            return EXIT_FAILURE;
+        }
         print_docker_cmds(result);
         struct docker_network_create *cmd = (struct docker_network_create *) result.arguments;
         create_network(cmd->name, cmd->cider, "bridge");

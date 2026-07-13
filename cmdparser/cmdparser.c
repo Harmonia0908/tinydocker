@@ -1,10 +1,11 @@
 #include <stdlib.h>
 #include <argp.h>
-#include <stdlib.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include "cmdparser.h"
+#include "../core/safety.h"
 
 #define DOCKER_RUN_OPTION_CAPACITY 128
 #define DOCKER_RUN_ARG_CAPACITY 128
@@ -57,45 +58,53 @@ struct argp_option docker_run_option_setting[] = {
 
 struct volume_config parse_volume_config(char* input) {
     struct volume_config result;
+    char path_check[TINYDOCKER_MAX_VOLUME_PATH + 16] = {0};
+    char error[160] = {0};
+    const char *first_separator;
+    const char *second_separator;
+    size_t host_length;
+    size_t container_length;
+
     memset(&result, 0, sizeof(result));
-    result.ro = 0; //默认为读写挂载
-    char* token;
-    int i = 0;
-
-    // 使用strtok函数分割字符串
-    token = strtok(input, ":");
-    while (token != NULL) {
-        if (i == 0) {
-            if (strlen(token) >= sizeof(result.host)) {
-                result.ro = -1;
-                return result;
-            }
-            snprintf(result.host, sizeof(result.host), "%s", token);
-        } else if (i == 1) {
-            if (strlen(token) >= sizeof(result.container)) {
-                result.ro = -1;
-                return result;
-            }
-            snprintf(result.container, sizeof(result.container), "%s", token);
-        } else if (i == 2) { // 指定了挂载模式, 且为只读
-            if (strcmp(token, "ro") == 0) {
-                result.ro = 1;
-            } else if (strcmp(token, "rw") == 0) {
-                result.ro = 0;
-            } else {
-                result.ro = -1;
-                return result;
-            }
-        } else {
-            result.ro = -1;
-            return result;
-        }
-        token = strtok(NULL, ":");
-        i++;
+    result.ro = -1;
+    if (input == NULL) {
+        return result;
     }
+    first_separator = strchr(input, ':');
+    if (first_separator == NULL || first_separator == input ||
+        first_separator[1] == '\0') {
+        return result;
+    }
+    second_separator = strchr(first_separator + 1, ':');
+    if (second_separator != NULL && strchr(second_separator + 1, ':') != NULL) {
+        return result;
+    }
+    host_length = (size_t)(first_separator - input);
+    container_length = second_separator == NULL ? strlen(first_separator + 1) :
+        (size_t)(second_separator - first_separator - 1);
+    if (host_length == 0U || container_length == 0U ||
+        host_length >= sizeof(result.host) ||
+        container_length >= sizeof(result.container)) {
+        return result;
+    }
+    memcpy(result.host, input, host_length);
+    memcpy(result.container, first_separator + 1, container_length);
+    if (result.host[0] != '/' ||
+        td_join_rootfs_path("/rootfs", result.container, path_check,
+                            sizeof(path_check), error, sizeof(error)) != 0) {
+        return result;
+    }
+    result.ro = 0;
+    if (second_separator != NULL) {
+        const char *mode = second_separator + 1;
 
-    // 如果输入的字符串只有a和b，将c设为空字符串
-    if (i < 2) {
+        if (strcmp(mode, "ro") == 0) {
+            result.ro = 1;
+        } else if (strcmp(mode, "rw") != 0) {
+            result.ro = -1;
+        }
+    }
+    if (strchr(result.host, '\n') != NULL || strchr(result.host, '\r') != NULL) {
         result.ro = -1;
     }
     return result;
@@ -128,15 +137,14 @@ static error_t docker_run_parse_func(int key, char *arg, struct argp_state *stat
                 printf("too many port mappings, max is %d\n", DOCKER_RUN_OPTION_CAPACITY);
                 exit(-1);
             }
-            struct key_val_pair kv = parse_key_val_pair(arg, ":");
-            if (kv.key == NULL || kv.val == NULL) {
-                printf("端口映射参数配置错误, 请使用: host_port:container_port 的形式\n");
+            char error[160] = {0};
+            struct port_map mapping = {0};
+            if (td_parse_port_mapping(arg, &mapping.host_port,
+                                      &mapping.container_port,
+                                      error, sizeof(error)) != 0) {
+                printf("invalid port mapping '%s': %s\n", arg, error);
                 exit(-1);
             }
-            struct port_map mapping = {
-                .host_port = atoi(kv.key),
-                .container_port = atoi(kv.val)
-            };
             arguments->port_mapping[arguments->port_mapping_cnt++] = mapping;
             break;
         }
@@ -146,12 +154,28 @@ static error_t docker_run_parse_func(int key, char *arg, struct argp_state *stat
         case 'd':
             arguments->detach = 1;
             break;
-        case 'c':
-            arguments->cpu = atoi(arg);
+        case 'c': {
+            char error[160] = {0};
+            long value = 0;
+            if (td_parse_long(arg, 1000, INT_MAX, &value,
+                              error, sizeof(error)) != 0) {
+                printf("invalid CPU quota '%s': %s\n", arg, error);
+                exit(-1);
+            }
+            arguments->cpu = (int)value;
             break;
-        case 'm':
-            arguments->memory = atoi(arg);
+        }
+        case 'm': {
+            char error[160] = {0};
+            long value = 0;
+            if (td_parse_long(arg, 1, INT_MAX, &value,
+                              error, sizeof(error)) != 0) {
+                printf("invalid memory limit '%s': %s\n", arg, error);
+                exit(-1);
+            }
+            arguments->memory = (int)value;
             break;
+        }
         case 'n':
             arguments->name =arg;
             break;
@@ -320,9 +344,17 @@ static error_t docker_stop_parse_func(int key, char *arg, struct argp_state *sta
         return 0;
 
     switch (key) {
-        case 't':
-            arguments->time = atoi(arg);
+        case 't': {
+            char error[160] = {0};
+            long value = 0;
+            if (td_parse_long(arg, 0, 3600, &value,
+                              error, sizeof(error)) != 0) {
+                printf("invalid stop timeout '%s': %s\n", arg, error);
+                exit(-1);
+            }
+            arguments->time = (int)value;
             break;
+        }
         case ARGP_KEY_ARG:
             for (int i = state->next - 1; i < state->argc; i++) {
                 arguments->container_names[arguments->container_cnt++] = state->argv[i];  
@@ -363,54 +395,23 @@ void docker_network_create_cmd_print(struct docker_network_create *a) {
     printf("cidr=%s\n", a->cider);
 }
 
-static int validate_name_chars(const char *name) {
-    for (const char *p = name; *p != '\0'; p++) {
-        if ((*p >= 'a' && *p <= 'z') ||
-            (*p >= 'A' && *p <= 'Z') ||
-            (*p >= '0' && *p <= '9') ||
-            *p == '.' || *p == '_' || *p == '-') {
-            continue;
-        }
-        printf("invalid character in name '%s': '%c' (0x%02x)\n", name, *p, (unsigned char)*p);
-        printf("allowed characters are [a-z A-Z 0-9 . _ -]\n");
-        return 0;
-    }
-    return 1;
-}
-
 static int validate_container_name(char *container_name) {
-    if (container_name == NULL || strlen(container_name) == 0) {
-        printf("invalid container name: empty\n");
+    char error[160] = {0};
+    if (td_validate_name(container_name, TINYDOCKER_MAX_CONTAINER_NAME,
+                         error, sizeof(error)) != 0) {
+        printf("invalid container name: %s\n", error);
         return 0;
     }
-
-    if (strlen(container_name) > TINYDOCKER_MAX_CONTAINER_NAME) {
-        printf("invalid container name: length must be <= %d\n", TINYDOCKER_MAX_CONTAINER_NAME);
-        return 0;
-    }
-
-    if (!validate_name_chars(container_name)) {
-        return 0;
-    }
-
     return 1;
 }
 
 static int validate_network_name(char *network_name) {
-    if (network_name == NULL || strlen(network_name) == 0) {
-        printf("invalid network name: empty\n");
+    char error[160] = {0};
+    if (td_validate_name(network_name, TINYDOCKER_MAX_NETWORK_NAME,
+                         error, sizeof(error)) != 0) {
+        printf("invalid network name: %s\n", error);
         return 0;
     }
-
-    if (strlen(network_name) > TINYDOCKER_MAX_NETWORK_NAME) {
-        printf("invalid network name: length must be <= %d\n", TINYDOCKER_MAX_NETWORK_NAME);
-        return 0;
-    }
-
-    if (!validate_name_chars(network_name)) {
-        return 0;
-    }
-
     return 1;
 }
 
@@ -633,6 +634,14 @@ struct docker_cmd parse_docker_cmd(int argc, char *argv[]) {
             arguments->name = argv[3];
         arguments->cider = argv[4];
         if (!validate_network_name(arguments->name)) {
+            exit(-1);
+        }
+        uint32_t network_address = 0;
+        unsigned int prefix = 0;
+        char cidr_error[160] = {0};
+        if (td_parse_ipv4_cidr(arguments->cider, &network_address, &prefix,
+                               cidr_error, sizeof(cidr_error)) != 0) {
+            printf("invalid network CIDR: %s\n", cidr_error);
             exit(-1);
         }
         struct docker_cmd result = {.cmd_type=DOCKER_NETWORK_CREATE, .arguments=arguments};

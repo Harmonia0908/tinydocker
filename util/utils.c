@@ -1,7 +1,6 @@
 #define _XOPEN_SOURCE 500
 #include <sys/stat.h>
 #include <errno.h>
-#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
@@ -11,12 +10,13 @@
 #include <unistd.h>
 #include <limits.h>
 #include <stdlib.h>
-#include <ftw.h>
 #include <openssl/evp.h>
 #include <limits.h>
 #include <sys/stat.h>
 #include "utils.h"
 #include "../logger/log.h"
+#include "../core/fs.h"
+#include "../core/process.h"
 
 
 
@@ -97,16 +97,8 @@ int path_exist(const char *path) {
 }
 
 
-int unlink_cb(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf) {
-    int rv = remove(fpath);
-    if (rv) {
-        perror(fpath);
-    }
-    return rv;
-}
-
 int remove_dir(char *path) {
-    return nftw(path, unlink_cb, 64, FTW_DEPTH | FTW_PHYS);
+    return td_remove_tree(path);
 }
 
 
@@ -177,19 +169,18 @@ char** split_string(char* input) {
 }
 
 int create_tar(char *dir, char *tar_path) {
-    char cmd[512] = {0};
-    sprintf(cmd, "tar -czf %s -C %s .", tar_path, dir);
-    log_info("%s", cmd);
-    int t = system(cmd);
-    return t;
+    char *const arguments[] = {"tar", "-czf", tar_path, "-C", dir, ".", NULL};
+    log_info("create archive %s from %s without a shell", tar_path, dir);
+    return td_run_command(arguments);
 }
 
 
 int extract_tar(const char* tar_file, const char* extract_dir) {
-    char cmd[258] = {0};
-    sprintf(cmd, "tar -xf %s -C %s", tar_file, extract_dir);
-    log_info("%s", cmd);
-    return system(cmd);
+    char *const arguments[] = {"tar", "-xf", (char *)tar_file, "-C",
+                               (char *)extract_dir, "--no-same-owner",
+                               "--no-same-permissions", NULL};
+    log_info("extract archive %s into %s without a shell", tar_file, extract_dir);
+    return td_run_command(arguments);
 }
 
 

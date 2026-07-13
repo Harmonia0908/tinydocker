@@ -3,6 +3,7 @@
 
 #define TINYDOCKER_MAX_CONTAINER_NAME 127
 #define TINYDOCKER_MAX_NETWORK_NAME   15    /* Linux IFNAMSIZ */
+#define TINYDOCKER_MAX_VOLUME_PATH    1023
 
 enum docker_command_type {
     DOCKER_RUN,
@@ -32,8 +33,8 @@ struct port_map {
 };
 
 struct volume_config {
-    char host[50]; //主机路径
-    char container[50]; //容器路径
+    char host[TINYDOCKER_MAX_VOLUME_PATH + 1]; //主机路径
+    char container[TINYDOCKER_MAX_VOLUME_PATH + 1]; //容器路径
     int ro; //只读:1, 读写:0, 错误配置:-1
 };
 

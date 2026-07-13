@@ -18,29 +18,43 @@
 #include "workspace.h"
 #include "status_info.h"
 #include "network.h"
+#include "../core/cgroup_parse.h"
+#include "../core/safety.h"
+#include "../core/process.h"
 
 
 extern char **environ;
 static int pipe_fd[2];
 
-//初始化docker运行说需要的目录
+int init_runtime_dirs(void) {
+    const char *directories[] = {
+        TINYDOCKER_RUNTIME_DIR,
+        CONTAINER_STATUS_INFO_DIR,
+        CONTAINER_LOG_DIR,
+        TINYDOCKER_RUNTIME_DIR "/containers",
+        TINYDOCKER_RUNTIME_DIR "/images",
+        NULL
+    };
+    for (size_t index = 0U; directories[index] != NULL; index++) {
+        if (!path_exist(directories[index]) && make_path(directories[index]) != 0) {
+            log_error("failed to create runtime directory %s: %s",
+                      directories[index], strerror(errno));
+            return -1;
+        }
+    }
+    return 0;
+}
+
+//初始化 run 所需目录和宿主机网络；只读命令不得调用。
 int init_docker_env() {
-    if (!path_exist(TINYDOCKER_RUNTIME_DIR)) {
-        make_path(TINYDOCKER_RUNTIME_DIR);
-    }
-
-    if (!path_exist(CONTAINER_STATUS_INFO_DIR)) {
-        make_path(CONTAINER_STATUS_INFO_DIR);
-    }
-
-    if (!path_exist(CONTAINER_LOG_DIR)) {
-        make_path(CONTAINER_LOG_DIR);
+    if (init_runtime_dirs() != 0) {
+        return -1;
     }
 
     int r = create_default_bridge();
     if (r != 0) {
         log_error("failed to create detault net bridge");
-        exit(-1);
+        return -1;
     }
 
     //添加iptables支持外部响应可以返回到容器内部
@@ -48,7 +62,10 @@ int init_docker_env() {
     sprintf(iptable_rule, "-t nat -A POSTROUTING -s %s -j MASQUERADE", TINYDOCKER_DEFAULT_NETWORK_CIDR);
     char bash_script[1024] = {0}; //检查规则是否已经存在, 如果规则不存在，添加它
     sprintf(bash_script, "if ! iptables -C %s 2>/dev/null; then iptables %s; fi", iptable_rule, iptable_rule);
-    system(bash_script);
+    if (system(bash_script) != 0) {
+        log_error("failed to ensure default MASQUERADE rule");
+        return -1;
+    }
     return 0;
 }
 
@@ -473,29 +490,39 @@ int docker_ps(struct docker_ps_arguments *args) {
 
 int docker_top(struct docker_top_arguments *args) {
     int pid_list[4096];
-    int pid_cnt = get_container_processes_id(args->container_name, pid_list);
+    int pid_cnt = get_container_processes_id(args->container_name, pid_list,
+                                             sizeof(pid_list) / sizeof(pid_list[0]));
     if (pid_cnt == -1) {
         log_error("failed to get container process list");
         return -1;
     }
 
-    char *pid_str_list = (char *) malloc (sizeof(char) * pid_cnt * 32);
-    strcpy(pid_str_list, "");  // 清空结果字符串
-    char str_pid[64];
-    for (int i = 0; i < pid_cnt; i++) {
-        strcpy(str_pid, "");  // 清空结果字符串
-        sprintf(str_pid, "%d", pid_list[i]);
-        strcat(pid_str_list, str_pid);
-        strcat(pid_str_list, " ");
+    if (pid_cnt == 0) {
+        log_warn("container %s has no processes", args->container_name);
+        return 0;
     }
 
-    char *cmd = (char *) malloc (sizeof(char) * (strlen(pid_str_list) + 32));
-    sprintf(cmd, "ps -f -p %s", pid_str_list);
-    log_info("cmd: %s", cmd);
-    int ret = system(cmd);
+    size_t pid_buffer_size = (size_t)pid_cnt * 32U + 1U;
+    char *pid_str_list = calloc(pid_buffer_size, 1U);
+    if (pid_str_list == NULL) {
+        return -1;
+    }
+    size_t used = 0U;
+    for (int i = 0; i < pid_cnt; i++) {
+        int written = snprintf(pid_str_list + used, pid_buffer_size - used,
+                               "%s%d", i == 0 ? "" : ",", pid_list[i]);
+        if (written < 0 || (size_t)written >= pid_buffer_size - used) {
+            free(pid_str_list);
+            return -1;
+        }
+        used += (size_t)written;
+    }
+
+    char *const command[] = {"ps", "-f", "-p", pid_str_list, NULL};
+    log_info("run ps without a shell for container %s", args->container_name);
+    int ret = td_run_command(command);
 
     free(pid_str_list);
-    free(cmd);
     return ret;
 }
 
@@ -543,7 +570,8 @@ int docker_exec(struct docker_exec_arguments *args) {
 
     // 找出目标容器中的一个进程ID, 该进程用来寻找ns文件
     int pid_list[4096];
-    int pid_cnt = get_container_processes_id(args->container_name, pid_list);
+    int pid_cnt = get_container_processes_id(args->container_name, pid_list,
+                                             sizeof(pid_list) / sizeof(pid_list[0]));
     if (pid_cnt <= 0) {
         log_error("failed to get container process list");
         return -1;
@@ -601,7 +629,8 @@ int docker_stop(struct docker_stop_arguments *args) {
     for (int c = 0; c < args->container_cnt; c++) {
         char *container_name = args->container_names[c];
         int pid_list[1024];
-        int pid_cnt = get_container_processes_id(container_name, pid_list);
+        int pid_cnt = get_container_processes_id(container_name, pid_list,
+                                                 sizeof(pid_list) / sizeof(pid_list[0]));
         for (int p = 0; p < pid_cnt; p++) {
             int ret = kill(pid_list[p], SIGTERM);
             log_info("send SIGTERM to pid %d in container %s ret %d", pid_list[p], container_name, ret);
@@ -614,7 +643,8 @@ int docker_stop(struct docker_stop_arguments *args) {
         for (int c = 0; c < args->container_cnt; c++) {
             char *container_name = args->container_names[c];
             int pid_list[1024];
-            int pid_cnt = get_container_processes_id(container_name, pid_list);
+            int pid_cnt = get_container_processes_id(container_name, pid_list,
+                                                     sizeof(pid_list) / sizeof(pid_list[0]));
             for (int p = 0; p < pid_cnt; p++) {
                 int ret = kill(pid_list[p], SIGKILL);
                 log_info("send SIGKILL to pid %d in container %s ret %d", pid_list[p], container_name, ret);
@@ -743,34 +773,25 @@ static void read_cpu_usage_usec(char *cgroup_path, char *buf, int buf_size) {
         return;
     }
 
-    char key[128] = {0};
-    char value[128] = {0};
+    char contents[4096] = {0};
+    char error[160] = {0};
     snprintf(buf, buf_size, "N/A");
-    while (fscanf(file, "%127s %127s", key, value) == 2) {
-        if (strcmp(key, "usage_usec") == 0) {
-            snprintf(buf, buf_size, "%s", value);
-            break;
-        }
+    (void)fread(contents, 1, sizeof(contents) - 1U, file);
+    if (ferror(file) == 0 &&
+        td_parse_cgroup_stat(contents, "usage_usec", buf, (size_t)buf_size,
+                             error, sizeof(error)) != 0) {
+        log_warn("failed to parse %s: %s", path, error);
     }
 
     fclose(file);
 }
 
 static void format_bytes(char *raw, char *buf, int buf_size) {
-    if (strcmp(raw, "N/A") == 0 || strcmp(raw, "max") == 0) {
-        snprintf(buf, buf_size, "%s", raw);
-        return;
-    }
-
-    long long bytes = atoll(raw);
-    if (bytes < 1024) {
-        snprintf(buf, buf_size, "%lldB", bytes);
-    } else if (bytes < 1024 * 1024) {
-        snprintf(buf, buf_size, "%.1fKB", bytes / 1024.0);
-    } else if (bytes < 1024LL * 1024 * 1024) {
-        snprintf(buf, buf_size, "%.1fMB", bytes / 1024.0 / 1024.0);
-    } else {
-        snprintf(buf, buf_size, "%.1fGB", bytes / 1024.0 / 1024.0 / 1024.0);
+    char error[160] = {0};
+    if (td_format_bytes(raw, buf, (size_t)buf_size,
+                        error, sizeof(error)) != 0) {
+        log_warn("failed to format cgroup byte value '%s': %s", raw, error);
+        (void)snprintf(buf, (size_t)buf_size, "N/A");
     }
 }
 
