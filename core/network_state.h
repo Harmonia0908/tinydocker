@@ -23,5 +23,8 @@ int td_parse_network_record(const char *line, struct td_network_record *record,
 int td_format_network_record(const struct td_network_record *record,
                              char *output, size_t output_size,
                              char *error, size_t error_size);
+int td_network_record_names_are_unique(const struct td_network_record *records,
+                                       size_t record_count,
+                                       char *error, size_t error_size);
 
 #endif

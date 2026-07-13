@@ -249,3 +249,24 @@ int td_format_network_record(const struct td_network_record *record,
     }
     return 0;
 }
+
+int td_network_record_names_are_unique(const struct td_network_record *records,
+                                       size_t record_count,
+                                       char *error, size_t error_size)
+{
+    if ((record_count > 0U && records == NULL) ||
+        record_count > TD_NETWORK_MAX_RECORDS) {
+        set_error(error, error_size, "invalid network record list");
+        return -1;
+    }
+    for (size_t index = 0U; index < record_count; index++) {
+        for (size_t previous = 0U; previous < index; previous++) {
+            if (strcmp(records[index].name, records[previous].name) == 0) {
+                set_error(error, error_size, "duplicate network name: %s",
+                          records[index].name);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}

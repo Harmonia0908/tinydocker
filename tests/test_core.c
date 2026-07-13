@@ -153,6 +153,13 @@ static void test_network_state_codec(void)
     CHECK(td_parse_network_record(output, &round_trip, error,
                                   sizeof(error)) == 0);
     CHECK(round_trip.used_ip_count == record.used_ip_count);
+    struct td_network_record records[2] = {record, round_trip};
+    CHECK(td_network_record_names_are_unique(records, 2U, error,
+                                             sizeof(error)) == -1);
+    CHECK(strstr(error, "duplicate") != NULL);
+    (void)snprintf(records[1].name, sizeof(records[1].name), "other");
+    CHECK(td_network_record_names_are_unique(records, 2U, error,
+                                             sizeof(error)) == 0);
     CHECK(td_parse_network_record("missing:bridge:172.18.0.0/24", &record,
                                   error, sizeof(error)) == -1);
     CHECK(strstr(error, "missing") != NULL);

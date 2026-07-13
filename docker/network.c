@@ -4,6 +4,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <net/if.h>
 #include <stdint.h>
 #include <sys/file.h>
@@ -64,10 +65,11 @@ static int get_cidr_range(const char *cidr, unsigned int *minimum,
 static int load_network_records(struct td_network_record *records,
                                 size_t capacity, size_t *record_count) {
     enum { MAX_NETWORK_STATE_SIZE = 1024 * 1024 };
-    char line[4096] = {0};
     struct stat status;
+    char *data = NULL;
+    size_t offset = 0U;
+    size_t cursor = 0U;
     int state_fd;
-    FILE *file;
     size_t count = 0U;
 
     if (records == NULL || capacity == 0U || record_count == NULL) {
@@ -90,38 +92,65 @@ static int load_network_records(struct td_network_record *records,
         (void)close(state_fd);
         return -1;
     }
-    file = fdopen(state_fd, "r");
-    if (file == NULL) {
+    data = malloc((size_t)status.st_size + 1U);
+    if (data == NULL) {
         (void)close(state_fd);
         return -1;
     }
-    while (fgets(line, sizeof(line), file) != NULL) {
-        char error[160] = {0};
-        size_t length = strlen(line);
-
-        if (length == 0U || (line[length - 1U] != '\n' && !feof(file))) {
-            log_error("network state contains an oversized record");
-            (void)fclose(file);
+    while (offset < (size_t)status.st_size) {
+        ssize_t bytes_read = read(state_fd, data + offset,
+                                  (size_t)status.st_size - offset);
+        if (bytes_read < 0 && errno == EINTR) {
+            continue;
+        }
+        if (bytes_read <= 0) {
+            log_error("short read from network state");
+            free(data);
+            (void)close(state_fd);
             return -1;
         }
-        line[strcspn(line, "\r\n")] = '\0';
+        offset += (size_t)bytes_read;
+    }
+    if (close(state_fd) != 0) {
+        free(data);
+        return -1;
+    }
+    if (memchr(data, '\0', offset) != NULL) {
+        log_error("network state contains a NUL byte");
+        free(data);
+        return -1;
+    }
+    data[offset] = '\0';
+    while (cursor < offset) {
+        char error[160] = {0};
+        char *line = data + cursor;
+        char *line_end = memchr(line, '\n', offset - cursor);
+        size_t length = line_end == NULL ? offset - cursor :
+            (size_t)(line_end - line);
+
+        if (length == 0U || length >= 4096U ||
+            memchr(line, '\r', length) != NULL) {
+            log_error("network state contains an invalid record boundary");
+            free(data);
+            return -1;
+        }
+        line[length] = '\0';
         if (count >= capacity ||
             td_parse_network_record(line, &records[count], error,
                                     sizeof(error)) != 0) {
             log_error("corrupt network state record: %s",
                       count >= capacity ? "record capacity exceeded" : error);
-            (void)fclose(file);
+            free(data);
             return -1;
         }
         count++;
+        cursor += length + (line_end == NULL ? 0U : 1U);
     }
-    if (ferror(file) != 0) {
-        log_error("failed to read network state: %s", strerror(errno));
-        (void)fclose(file);
-        return -1;
-    }
-    if (fclose(file) != 0) {
-        log_error("failed to close network state: %s", strerror(errno));
+    free(data);
+    char error[160] = {0};
+    if (td_network_record_names_are_unique(records, count, error,
+                                           sizeof(error)) != 0) {
+        log_error("corrupt network state: %s", error);
         return -1;
     }
     *record_count = count;
@@ -203,6 +232,18 @@ static int write_network_records(const struct td_network_record *records,
     file = NULL;
     if (rename(temporary_path, CONTAINER_NETWORKS_FILE) != 0) {
         goto cleanup;
+    }
+    int directory_fd = open(TINYDOCKER_RUNTIME_DIR,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory_fd < 0 || fsync(directory_fd) != 0) {
+        int saved_errno = errno;
+        if (directory_fd >= 0) {
+            (void)close(directory_fd);
+        }
+        log_warn("network state was published but directory sync failed: %s",
+                 strerror(saved_errno));
+    } else {
+        (void)close(directory_fd);
     }
     result = 0;
 
@@ -307,10 +348,147 @@ static int net_has_exist(char *brname) {
     return if_nametoindex(brname) == 0U ? 0 : 1;
 }
 
+static int build_interface_alias(const char *kind, const char *name,
+                                 char *alias, size_t alias_size) {
+    int written;
+
+    if (kind == NULL || name == NULL || alias == NULL || alias_size == 0U) {
+        return -1;
+    }
+    written = snprintf(alias, alias_size, "tinydocker-%s:%s", kind, name);
+    return written < 0 || (size_t)written >= alias_size ? -1 : 0;
+}
+
+static int read_interface_alias(const char *interface_name, char *alias,
+                                size_t alias_size) {
+    char path[PATH_MAX] = {0};
+    size_t used = 0U;
+    int fd;
+    int written;
+
+    if (interface_name == NULL || alias == NULL || alias_size < 2U) {
+        return -1;
+    }
+    written = snprintf(path, sizeof(path), "/sys/class/net/%s/ifalias",
+                       interface_name);
+    if (written < 0 || (size_t)written >= sizeof(path)) {
+        return -1;
+    }
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        return -1;
+    }
+    while (used + 1U < alias_size) {
+        ssize_t count = read(fd, alias + used, alias_size - used - 1U);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count < 0) {
+            (void)close(fd);
+            return -1;
+        }
+        if (count == 0) {
+            break;
+        }
+        used += (size_t)count;
+    }
+    if (used + 1U == alias_size) {
+        char extra;
+        ssize_t count;
+        do {
+            count = read(fd, &extra, 1U);
+        } while (count < 0 && errno == EINTR);
+        if (count != 0) {
+            (void)close(fd);
+            return -1;
+        }
+    }
+    if (close(fd) != 0) {
+        return -1;
+    }
+    alias[used] = '\0';
+    alias[strcspn(alias, "\r\n")] = '\0';
+    return 0;
+}
+
+static int verify_interface_ownership(const char *interface_name,
+                                      const char *expected_alias,
+                                      int require_bridge) {
+    char actual_alias[256] = {0};
+
+    if (if_nametoindex(interface_name) == 0U) {
+        return 0;
+    }
+    if (require_bridge != 0) {
+        char bridge_path[PATH_MAX] = {0};
+        struct stat status;
+        int written = snprintf(bridge_path, sizeof(bridge_path),
+                               "/sys/class/net/%s/bridge", interface_name);
+        if (written < 0 || (size_t)written >= sizeof(bridge_path) ||
+            stat(bridge_path, &status) != 0 || !S_ISDIR(status.st_mode)) {
+            return -1;
+        }
+    }
+    if (read_interface_alias(interface_name, actual_alias,
+                             sizeof(actual_alias)) != 0 ||
+        strcmp(actual_alias, expected_alias) != 0) {
+        return -1;
+    }
+    return 1;
+}
+
+static int delete_owned_bridge(const char *name, const char *expected_alias) {
+    unsigned int original_index = if_nametoindex(name);
+    char *const set_down[] = {"ip", "link", "set", "dev", (char *)name,
+                              "down", NULL};
+    char *const delete_bridge[] = {"brctl", "delbr", (char *)name, NULL};
+
+    if (original_index == 0U) {
+        return 0;
+    }
+    if (verify_interface_ownership(name, expected_alias, 1) != 1) {
+        log_error("refusing to delete bridge without matching ownership: %s", name);
+        return -1;
+    }
+    if (td_run_command(set_down) != 0) {
+        log_warn("failed to set owned bridge down before deletion: %s", name);
+    }
+    if (if_nametoindex(name) != original_index ||
+        verify_interface_ownership(name, expected_alias, 1) != 1) {
+        log_error("bridge identity changed during deletion: %s", name);
+        return -1;
+    }
+    if (td_run_command(delete_bridge) != 0) {
+        log_error("failed to remove owned bridge %s", name);
+        return -1;
+    }
+    return 0;
+}
+
+static int delete_owned_veth(const char *name, const char *expected_alias) {
+    unsigned int original_index = if_nametoindex(name);
+    char *const delete_veth[] = {"ip", "link", "delete", (char *)name, NULL};
+
+    if (original_index == 0U) {
+        return 0;
+    }
+    if (verify_interface_ownership(name, expected_alias, 0) != 1 ||
+        if_nametoindex(name) != original_index) {
+        log_error("refusing to delete veth without matching ownership: %s", name);
+        return -1;
+    }
+    if (td_run_command(delete_veth) != 0) {
+        log_error("failed to delete owned veth: %s", name);
+        return -1;
+    }
+    return 0;
+}
+
 int create_network(char *name, char *cidr_network, char *driver) {
     struct td_network_record network_record;
     char serialized[4096] = {0};
     char validation_error[160] = {0};
+    char expected_alias[256] = {0};
     int metadata_exists;
     int name_length;
     int driver_length;
@@ -331,6 +509,8 @@ int create_network(char *name, char *cidr_network, char *driver) {
         driver_length < 0 ||
         (size_t)driver_length >= sizeof(network_record.driver) ||
         cidr_length < 0 || (size_t)cidr_length >= sizeof(network_record.cidr) ||
+        build_interface_alias("network", name, expected_alias,
+                              sizeof(expected_alias)) != 0 ||
         td_format_network_record(&network_record, serialized,
                                  sizeof(serialized), validation_error,
                                  sizeof(validation_error)) != 0) {
@@ -355,16 +535,26 @@ int create_network(char *name, char *cidr_network, char *driver) {
 
     //创建网桥
     char *const add_bridge[] = {"brctl", "addbr", name, NULL};
+    char *const set_alias[] = {"ip", "link", "set", "dev", name, "alias",
+                               expected_alias, NULL};
     if (td_run_command(add_bridge) != 0) {
         log_error("failed create new bridge for %s", name);
+        return -1;
+    }
+    unsigned int created_index = if_nametoindex(name);
+    if (created_index == 0U || td_run_command(set_alias) != 0) {
+        char *const delete_created_bridge[] = {"brctl", "delbr", name, NULL};
+        if (created_index != 0U && if_nametoindex(name) == created_index) {
+            (void)td_run_command(delete_created_bridge);
+        }
+        log_error("failed to mark bridge ownership: %s", name);
         return -1;
     }
 
     //写入网络信息
     if (add_network_info(&network_record) == -1) {
         log_error("failed to save network info: %s", name);
-        char *const delete_bridge[] = {"brctl", "delbr", name, NULL};
-        (void)td_run_command(delete_bridge);
+        (void)delete_owned_bridge(name, expected_alias);
         return -1;
     }
 
@@ -376,8 +566,7 @@ int create_network(char *name, char *cidr_network, char *driver) {
     char *const set_up[] = {"ip", "link", "set", name, "up", NULL};
     if (td_run_command(set_address) != 0 || td_run_command(set_up) != 0) {
         log_error("failed to configure bridge %s", name);
-        char *const delete_bridge[] = {"brctl", "delbr", name, NULL};
-        if (td_run_command(delete_bridge) == 0) {
+        if (delete_owned_bridge(name, expected_alias) == 0) {
             (void)delete_network_info(name);
         } else {
             log_error("bridge rollback failed; keeping network metadata for safe retry: %s",
@@ -395,11 +584,19 @@ int create_default_bridge(void) {
     if (net_has_exist(TINYDOCKER_DEFAULT_NETWORK_NAME) == 0) {
         log_info("init detail bridge network %s for tinydocker", TINYDOCKER_DEFAULT_NETWORK_NAME);
         ret_val = create_network(TINYDOCKER_DEFAULT_NETWORK_NAME, TINYDOCKER_DEFAULT_NETWORK_CIDR, "bridge");
+        if (ret_val != 0) {
+            return -1;
+        }
     } else {
         struct td_network_record existing;
+        char expected_alias[256] = {0};
         if (read_network_info(TINYDOCKER_DEFAULT_NETWORK_NAME, &existing) != 0 ||
             strcmp(existing.driver, "bridge") != 0 ||
-            strcmp(existing.cidr, TINYDOCKER_DEFAULT_NETWORK_CIDR) != 0) {
+            strcmp(existing.cidr, TINYDOCKER_DEFAULT_NETWORK_CIDR) != 0 ||
+            build_interface_alias("network", TINYDOCKER_DEFAULT_NETWORK_NAME,
+                                  expected_alias, sizeof(expected_alias)) != 0 ||
+            verify_interface_ownership(TINYDOCKER_DEFAULT_NETWORK_NAME,
+                                       expected_alias, 1) != 1) {
             log_error("refusing to adopt an existing default bridge without matching metadata");
             return -1;
         }
@@ -418,19 +615,15 @@ int create_default_bridge(void) {
 
 int delte_network(char *name) {
     struct td_network_record owned_network;
+    char expected_alias[256] = {0};
     if (read_network_info(name, &owned_network) != 0) {
         log_error("refusing to delete untracked network interface: %s", name);
         return -1;
     }
-    if (if_nametoindex(name) != 0U) {
-        char *const set_down[] = {"ip", "link", "set", "dev", name,
-                                  "down", NULL};
-        char *const delete_bridge[] = {"brctl", "delbr", name, NULL};
-        if (td_run_command(set_down) != 0 ||
-            td_run_command(delete_bridge) != 0) {
-            log_error("failed to remove bridge %s", name);
-            return -1;
-        }
+    if (build_interface_alias("network", name, expected_alias,
+                              sizeof(expected_alias)) != 0 ||
+        delete_owned_bridge(name, expected_alias) != 0) {
+        return -1;
     }
     return delete_network_info(name);
 }
@@ -621,19 +814,30 @@ int connect_container(char *container_name, char *network, char *ip_addr) {
     char *veth_container = "eth0";
     char veth_host[16] = {0};
     char veth_peer[16] = {0};
+    char expected_alias[256] = {0};
     char pid_text[32] = {0};
     char container_address[64] = {0};
     if (td_make_veth_name(container_name, veth_host, sizeof(veth_host)) != 0 ||
         td_make_veth_peer_name(container_name, veth_peer,
                                sizeof(veth_peer)) != 0 ||
+        build_interface_alias("container", container_name, expected_alias,
+                              sizeof(expected_alias)) != 0 ||
         snprintf(pid_text, sizeof(pid_text), "%d", one_pid) < 0 ||
         snprintf(container_address, sizeof(container_address), "%s/24", str_ip) < 0) {
+        (void)release_used_ip(network, str_ip);
+        return -1;
+    }
+    if (if_nametoindex(veth_host) != 0U || if_nametoindex(veth_peer) != 0U) {
+        log_error("refusing to replace an existing interface for container %s",
+                  container_name);
         (void)release_used_ip(network, str_ip);
         return -1;
     }
 
     char *const add_veth[] = {"ip", "link", "add", veth_peer, "type",
                               "veth", "peer", "name", veth_host, NULL};
+    char *const set_alias[] = {"ip", "link", "set", "dev", veth_host,
+                               "alias", expected_alias, NULL};
     char *const add_to_bridge[] = {"brctl", "addif", network, veth_host, NULL};
     char *const host_up[] = {"ip", "link", "set", veth_host, "up", NULL};
     char *const move_peer[] = {"ip", "link", "set", "dev", veth_peer,
@@ -654,8 +858,25 @@ int connect_container(char *container_name, char *network, char *ip_addr) {
                                "route", "add", "default", "via",
                                TINYDOCKER_DEFAULT_GATEWAY, "dev", veth_container, NULL};
 
-    if (td_run_command(add_veth) != 0 ||
-        td_run_command(add_to_bridge) != 0 ||
+    if (td_run_command(add_veth) != 0) {
+        (void)release_used_ip(network, str_ip);
+        log_error("failed to create veth pair for container %s", container_name);
+        return -1;
+    }
+    unsigned int created_host_index = if_nametoindex(veth_host);
+    if (created_host_index == 0U || td_run_command(set_alias) != 0) {
+        char *const delete_created_veth[] = {"ip", "link", "delete",
+                                             veth_host, NULL};
+        if (created_host_index != 0U &&
+            if_nametoindex(veth_host) == created_host_index) {
+            (void)td_run_command(delete_created_veth);
+        }
+        (void)release_used_ip(network, str_ip);
+        log_error("failed to mark veth ownership for container %s",
+                  container_name);
+        return -1;
+    }
+    if (td_run_command(add_to_bridge) != 0 ||
         td_run_command(host_up) != 0 ||
         td_run_command(move_peer) != 0 ||
         td_run_command(rename_peer) != 0 ||
@@ -664,8 +885,7 @@ int connect_container(char *container_name, char *network, char *ip_addr) {
         td_run_command(add_address) != 0 ||
         td_run_command(container_up) != 0 ||
         td_run_command(add_route) != 0) {
-        char *const delete_veth[] = {"ip", "link", "delete", veth_host, NULL};
-        (void)td_run_command(delete_veth);
+        (void)delete_owned_veth(veth_host, expected_alias);
         (void)release_used_ip(network, str_ip);
         log_error("failed to configure network for container %s", container_name);
         return -1;
@@ -677,7 +897,10 @@ int connect_container(char *container_name, char *network, char *ip_addr) {
 
 int disconnect_container(char *container_name, char *network) {
     char veth_host[16] = {0};
-    if (td_make_veth_name(container_name, veth_host, sizeof(veth_host)) != 0) {
+    char expected_alias[256] = {0};
+    if (td_make_veth_name(container_name, veth_host, sizeof(veth_host)) != 0 ||
+        build_interface_alias("container", container_name, expected_alias,
+                              sizeof(expected_alias)) != 0) {
         return -1;
     }
     if (if_nametoindex(veth_host) == 0U) {
@@ -685,13 +908,15 @@ int disconnect_container(char *container_name, char *network) {
     }
     char *const remove_from_bridge[] = {"brctl", "delif", network,
                                         veth_host, NULL};
-    char *const delete_veth[] = {"ip", "link", "delete", veth_host, NULL};
-    if (td_run_command(remove_from_bridge) != 0 ||
-        td_run_command(delete_veth) != 0) {
-        log_error("failed to disconnect veth %s", veth_host);
+    if (verify_interface_ownership(veth_host, expected_alias, 0) != 1) {
+        log_error("refusing to disconnect veth without matching ownership: %s",
+                  veth_host);
         return -1;
     }
-    return 0;
+    if (td_run_command(remove_from_bridge) != 0) {
+        log_warn("veth was not attached to bridge during cleanup: %s", veth_host);
+    }
+    return delete_owned_veth(veth_host, expected_alias);
 }
 
 
