@@ -2,11 +2,8 @@
 #define CONTAINER_H
 
 #include "../cmdparser/cmdparser.h"
+#include "../core/config.h"
 
-
-#define TINYDOCKER_RUNTIME_DIR "/home/xanarry/tinydocker_runtime"
-#define CONTAINER_STATUS_INFO_DIR "/home/xanarry/tinydocker_runtime/container_info"
-#define CONTAINER_LOG_DIR "/home/xanarry/tinydocker_runtime/logs"
 
 int init_docker_env(void);
 int init_runtime_dirs(void);

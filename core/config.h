@@ -1,0 +1,16 @@
+#ifndef TINYDOCKER_CORE_CONFIG_H
+#define TINYDOCKER_CORE_CONFIG_H
+
+#ifndef TINYDOCKER_RUNTIME_DIR
+#define TINYDOCKER_RUNTIME_DIR "/home/xanarry/tinydocker_runtime"
+#endif
+
+#ifndef TINYDOCKER_CGROUP_PARENT
+#define TINYDOCKER_CGROUP_PARENT "/sys/fs/cgroup/system.slice"
+#endif
+
+#define CONTAINER_STATUS_INFO_DIR TINYDOCKER_RUNTIME_DIR "/container_info"
+#define CONTAINER_LOG_DIR TINYDOCKER_RUNTIME_DIR "/logs"
+#define CONTAINER_NETWORKS_FILE TINYDOCKER_RUNTIME_DIR "/networks"
+
+#endif

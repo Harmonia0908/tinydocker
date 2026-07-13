@@ -11,14 +11,20 @@ RUNTIME_DIR="${RUNTIME_DIR:-/home/xanarry/tinydocker_runtime}"
 INFO_DIR="$RUNTIME_DIR/container_info"
 CONTAINER_DIR="$RUNTIME_DIR/containers/$NAME"
 CGROUP_DIR="/sys/fs/cgroup/system.slice/tinydocker-$NAME"
-TMP_DIR="$(mktemp -d)"
 CLEANUP_ENABLED=0
 
-if [ "$(id -u)" -eq 0 ]; then
-    SUDO=""
-else
-    SUDO="${SUDO:-sudo}"
+if [ "${TINYDOCKER_ALLOW_PRIVILEGED_DEMO:-0}" != "1" ]; then
+    cat >&2 <<'WARNING'
+[demo] REFUSED: this demo creates namespaces, mounts, cgroups, veth devices,
+and iptables rules. Review demo.sh and run only in a disposable Linux VM:
+  TINYDOCKER_ALLOW_PRIVILEGED_DEMO=1 bash demo.sh
+The script requires an already-root shell and never invokes sudo.
+WARNING
+    exit 2
 fi
+[ "$(uname -s)" = "Linux" ] || { printf '[demo] Linux is required.\n' >&2; exit 2; }
+[ "$(id -u)" -eq 0 ] || { printf '[demo] run explicitly as root; sudo is never invoked.\n' >&2; exit 2; }
+TMP_DIR="$(mktemp -d /tmp/tinydocker-demo.XXXXXX)"
 
 step_no=0
 
@@ -65,19 +71,8 @@ cleanup_demo_artifacts() {
         set -e
         return
     fi
-    if [ -n "${SUDO:-}" ]; then
-        $SUDO "$TD" stop -t 1 "$NAME" >/dev/null 2>&1
-        $SUDO "$TD" rm "$NAME" >/dev/null 2>&1
-        $SUDO rm -f "$INFO_DIR/$NAME" >/dev/null 2>&1
-        $SUDO rmdir "$CGROUP_DIR" >/dev/null 2>&1
-        $SUDO rm -rf "$CONTAINER_DIR" >/dev/null 2>&1
-    else
-        "$TD" stop -t 1 "$NAME" >/dev/null 2>&1
-        "$TD" rm "$NAME" >/dev/null 2>&1
-        rm -f "$INFO_DIR/$NAME" >/dev/null 2>&1
-        rmdir "$CGROUP_DIR" >/dev/null 2>&1
-        rm -rf "$CONTAINER_DIR" >/dev/null 2>&1
-    fi
+    "$TD" stop -t 1 "$NAME" >/dev/null 2>&1
+    "$TD" rm "$NAME" >/dev/null 2>&1
     rm -rf "$TMP_DIR"
     set -e
 }
@@ -92,10 +87,7 @@ check_command() {
 preflight() {
     step "Preflight: check host environment"
 
-    if [ "$(id -u)" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
-        fail "当前不是 root，且系统缺少 sudo。" "请使用 root 运行，或安装 sudo 后运行: sudo bash demo.sh"
-    fi
-    info "root 权限: $([ "$(id -u)" -eq 0 ] && printf 'yes' || printf 'will use sudo')"
+    info "root 权限: yes (explicitly provided; sudo is not used)"
 
     check_command make "请安装 make，例如 Ubuntu: sudo apt-get install make"
     check_command gcc "请安装 gcc，例如 Ubuntu: sudo apt-get install build-essential"
@@ -114,9 +106,6 @@ preflight() {
     fi
     info "image/rootfs: $IMAGE"
 
-    if ! $SUDO true >/dev/null 2>&1; then
-        fail "无法获取 root 权限。" "请确认当前用户有 sudo 权限，或直接使用 root 运行。"
-    fi
     CLEANUP_ENABLED=1
 }
 
@@ -135,7 +124,7 @@ build_binary() {
 
 run_container() {
     step "Run: start a busybox/alpine container"
-    run_capture "$TMP_DIR/run.out" $SUDO "$TD" run -d \
+    run_capture "$TMP_DIR/run.out" "$TD" run -d \
         -n "$NAME" \
         -c 20000 \
         -m 134217728 \
@@ -145,20 +134,20 @@ run_container() {
 
 inspect_container() {
     step "Inspect: show container metadata"
-    run_capture "$TMP_DIR/inspect.out" $SUDO "$TD" inspect "$NAME"
+    run_capture "$TMP_DIR/inspect.out" "$TD" inspect "$NAME"
 }
 
 stats_container() {
     step "Stats: show cgroup v2 resource metrics"
-    run_capture "$TMP_DIR/stats.out" $SUDO "$TD" stats "$NAME"
+    run_capture "$TMP_DIR/stats.out" "$TD" stats "$NAME"
 }
 
 stop_and_remove_container() {
     step "Stop: terminate the container"
-    run_capture "$TMP_DIR/stop.out" $SUDO "$TD" stop -t 1 "$NAME" || true
+    run_capture "$TMP_DIR/stop.out" "$TD" stop -t 1 "$NAME" || true
 
     step "Remove: remove container runtime artifacts"
-    run_capture "$TMP_DIR/rm.out" $SUDO "$TD" rm "$NAME" || true
+    run_capture "$TMP_DIR/rm.out" "$TD" rm "$NAME" || true
 }
 
 verify_cleanup() {
@@ -167,22 +156,22 @@ verify_cleanup() {
 
     if [ -e "$INFO_DIR/$NAME" ]; then
         info "found residual metadata: $INFO_DIR/$NAME"
-        run $SUDO rm -f "$INFO_DIR/$NAME"
         dirty=1
     fi
     if [ -d "$CGROUP_DIR" ]; then
         info "found residual cgroup: $CGROUP_DIR"
-        run $SUDO rmdir "$CGROUP_DIR" || true
         dirty=1
     fi
     if [ -d "$CONTAINER_DIR" ]; then
         info "found residual workspace: $CONTAINER_DIR"
-        run $SUDO rm -rf "$CONTAINER_DIR"
         dirty=1
     fi
 
     if [ "$dirty" -eq 0 ]; then
         info "no demo metadata/cgroup/workspace leftovers detected"
+    else
+        fail "demo cleanup left known artifacts; refusing direct rm/umount fallback" \
+             "inspect the listed paths in the disposable VM before manual cleanup"
     fi
 }
 

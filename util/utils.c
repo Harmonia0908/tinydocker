@@ -21,14 +21,6 @@
 
 
 
-off_t filesize(const char *filename) {
-    struct stat st;
-    if (stat(filename, &st) != 0) {
-        return 0;
-    }
-    return st.st_size;
-}
-
 #define BUFFER_SIZE 1024
 
 char* calculate_sha256(const char* file_path) {
@@ -83,7 +75,7 @@ char* calculate_sha256(const char* file_path) {
         return NULL;
     }
 
-    for (int i = 0; i < sha256_hash_len; i++) {
+    for (unsigned int i = 0U; i < sha256_hash_len; i++) {
         sprintf(&sha256_string[i * 2], "%02x", (unsigned int)sha256_hash[i]);
     }
 

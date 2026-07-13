@@ -12,12 +12,13 @@
 #include "../logger/log.h"
 #include "../core/safety.h"
 #include "../core/cgroup_parse.h"
+#include "../core/config.h"
 #include "../cmdparser/cmdparser.h"
 #include "cgroup.h"
 
 #define CGROUP_ROOT "/sys/fs/cgroup"
 #define TINYDOCKER_PREFIX "tinydocker"
-static const char cgroup_base[] = "/sys/fs/cgroup/system.slice";
+static const char cgroup_base[] = TINYDOCKER_CGROUP_PARENT;
 
 static int write_file(const char *path, const char *value) {
     int fd = open(path, O_WRONLY|O_TRUNC);

@@ -5,9 +5,8 @@
 #define TINYDOCKER_DEFAULT_NETWORK_CIDR "172.11.11.0/24"
 #define TINYDOCKER_DEFAULT_IP_ADDR_CIDR "172.11.11.1/24"
 #define TINYDOCKER_DEFAULT_GATEWAY "172.11.11.1"
-#define CONTAINER_NETWORKS_FILE "/home/xanarry/tinydocker_runtime/networks"
-
 #include "../cmdparser/cmdparser.h"
+#include "../core/config.h"
 
 struct network {
     char *name; //网络名
