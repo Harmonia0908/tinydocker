@@ -1,3 +1,6 @@
+> [!WARNING]
+> 本文是项目早期的容器原理学习笔记，保留了当时的实验命令和不安全示例，并不代表当前实现。不要在有重要容器、mount、network、iptables 或 cgroup 状态的宿主机直接执行其中的 `sudo`、`rm`、`umount` 或网络清理命令。当前支持范围、安全边界和测试入口以 [README](README.md) 与 [特权集成测试指南](docs/FULL_FUNCTION_TEST.md) 为准。
+
 docker容器的本质是一个宿主机上的一个进程，共享宿主机的硬件与内核。在Linux下通过namespace机制，给容器进程不同类型资源一个独立的视图对容器与宿主机做隔离，使得容器进程运行时看起来好像自己是在一个全新的空间下。
 
 关于Linux命名空间，网络操作的介绍本文不再赘述，本文档将着重描写tinydocker的宏观设计以及实现过程中遇到的细节问题。
@@ -1155,4 +1158,3 @@ void unset_container_port_map(char *container_ip) {
     }
 }
 ```
-
