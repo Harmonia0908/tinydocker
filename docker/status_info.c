@@ -105,7 +105,10 @@ static int read_process_start_time(pid_t pid, uint64_t *start_time) {
     return 0;
 }
 
-int create_container_info(struct docker_run_arguments *args, int pid, enum container_status status, char *ip_addr, int created_timestamp, struct container_info *info) {
+int create_container_info(struct docker_run_arguments *args, int pid,
+                          enum container_status status, char *ip_addr,
+                          time_t created_timestamp,
+                          struct container_info *info) {
     /*
     int pid; //容器进程ID;
     int detach//
@@ -140,7 +143,9 @@ int create_container_info(struct docker_run_arguments *args, int pid, enum conta
     }
     info->detach = args->detach;
 
-    int container_id_len = snprintf(info->container_id, sizeof(info->container_id), "%d", created_timestamp);
+    int container_id_len = snprintf(info->container_id,
+                                    sizeof(info->container_id), "%lld",
+                                    (long long)created_timestamp);
     if (container_id_len < 0 || (size_t) container_id_len >= sizeof(info->container_id)) {
         log_error("metadata field too long: container_id");
         return -1;

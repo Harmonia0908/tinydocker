@@ -6,10 +6,12 @@
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdint.h>
 #include <sys/stat.h>
 #include "../util/utils.h"
 #include "../logger/log.h"
 #include "../core/safety.h"
+#include "../core/cgroup_parse.h"
 #include "../cmdparser/cmdparser.h"
 #include "cgroup.h"
 
@@ -50,7 +52,7 @@ static int write_file(const char *path, const char *value) {
     return write_failed ? -1 : 0;
 }
 
-int get_container_cgroup_path(char *container_name, char *cgroup_path, size_t cgroup_path_size) {
+int get_container_cgroup_path(const char *container_name, char *cgroup_path, size_t cgroup_path_size) {
     char validation_error[160] = {0};
     if (td_validate_name(container_name, TINYDOCKER_MAX_CONTAINER_NAME,
                          validation_error, sizeof(validation_error)) != 0) {
@@ -65,7 +67,9 @@ int get_container_cgroup_path(char *container_name, char *cgroup_path, size_t cg
     return 0;
 }
 
-static int get_container_cgroup_file_path(char *container_name, char *file_name, char *path, size_t path_size) {
+static int get_container_cgroup_file_path(const char *container_name,
+                                          const char *file_name,
+                                          char *path, size_t path_size) {
     int ret = snprintf(path, path_size, "%s/%s-%s/%s", cgroup_base, TINYDOCKER_PREFIX, container_name, file_name);
     if (ret < 0 || (size_t) ret >= path_size) {
         log_error("container cgroup file path too long: %s/%s", container_name, file_name);
@@ -74,7 +78,7 @@ static int get_container_cgroup_file_path(char *container_name, char *file_name,
     return 0;
 }
 
-int write_pid_to_cgroup_procs(int pid, char *cgroup_procs_path) {    
+int write_pid_to_cgroup_procs(int pid, const char *cgroup_procs_path) {
     if (pid <= 0 || cgroup_procs_path == NULL) {
         log_error("invalid pid or cgroup.procs path");
         return -1;
@@ -88,7 +92,7 @@ int write_pid_to_cgroup_procs(int pid, char *cgroup_procs_path) {
     return write_file(cgroup_procs_path, pid_str);
 }
 
-int init_cgroup(char *container_name) {
+int init_cgroup(const char *container_name) {
     if (!path_exist("/sys/fs/cgroup/cgroup.controllers")) {
         log_error("cgroup v2 is not available at /sys/fs/cgroup");
         return -1;
@@ -111,7 +115,7 @@ int init_cgroup(char *container_name) {
     return ret;
 }
 
-int remove_cgroup(char *container_name) {
+int remove_cgroup(const char *container_name) {
     char cgroup_path[1024] = {0};
     if (get_container_cgroup_path(container_name, cgroup_path, sizeof(cgroup_path)) != 0) {
         return -1;
@@ -123,7 +127,7 @@ int remove_cgroup(char *container_name) {
     return -1;
 }
 
-static int set_mem_limit(char *container_name, int mem_max) {
+static int set_mem_limit(const char *container_name, int mem_max) {
     if (mem_max <= 0) {
         log_error("invalid mem_max value: %d", mem_max);
         return -1;
@@ -143,7 +147,7 @@ static int set_mem_limit(char *container_name, int mem_max) {
 }
 
 
-static int set_cpu_limit(char *container_name, int cpu_time) {
+static int set_cpu_limit(const char *container_name, int cpu_time) {
     if (cpu_time < 1000) {
         log_error("invalid cpu.max value: %d", cpu_time);
         return -1;
@@ -163,7 +167,7 @@ static int set_cpu_limit(char *container_name, int cpu_time) {
 }
 
 
-static int set_cpuset_limit(char *container_name, char *cpus) {
+static int set_cpuset_limit(const char *container_name, const char *cpus) {
     if (cpus == NULL) {
         log_error("invalid cpuset.cpus value, can not be NULL");
         return -1;
@@ -177,7 +181,7 @@ static int set_cpuset_limit(char *container_name, char *cpus) {
 }
 
 
-int apply_cgroup_limit_to_pid(char *container_name, int pid) {
+int apply_cgroup_limit_to_pid(const char *container_name, int pid) {
     char procs[256] = {0};
     if (get_container_cgroup_file_path(container_name, "cgroup.procs", procs, sizeof(procs)) != 0) {
         return -1;
@@ -186,7 +190,8 @@ int apply_cgroup_limit_to_pid(char *container_name, int pid) {
 }
 
 
-int set_cgroup_limits(char *container_name, int cpu, int memory, char *cpuset) {
+int set_cgroup_limits(const char *container_name, int cpu, int memory,
+                      const char *cpuset) {
     //设置内存限制
     if (memory > 0) {
         if (set_mem_limit(container_name, memory) != 0) {
@@ -214,7 +219,8 @@ int set_cgroup_limits(char *container_name, int cpu, int memory, char *cpuset) {
     return 0;
 }
 
-int get_container_processes_id(char *container_name, int *pid_list, size_t capacity) {
+int get_container_processes_id(const char *container_name, int *pid_list,
+                               size_t capacity) {
     char cgroup_procs_path[1024] = {0};
     if (get_container_cgroup_file_path(container_name, "cgroup.procs", cgroup_procs_path, sizeof(cgroup_procs_path)) != 0) {
         return -1;
@@ -236,29 +242,36 @@ int get_container_processes_id(char *container_name, int *pid_list, size_t capac
         return -1;
     }
 
-    char line[32];
-    int pid_cnt = 0;
-    while (fgets(line, sizeof(line), file)) {
-        char error[160] = {0};
-        long parsed_pid = 0;
-        line[strcspn(line, "\n")] = '\0';
-        if (td_parse_long(line, 1, INT_MAX, &parsed_pid,
-                          error, sizeof(error)) != 0) {
-            log_error("invalid pid in %s: %s", cgroup_procs_path, error);
-            (void)fclose(file);
-            return -1;
-        }
-        if ((size_t)pid_cnt >= capacity) {
-            log_error("cgroup process list exceeds capacity %zu for %s",
-                      capacity, container_name);
-            (void)fclose(file);
-            return -1;
-        }
-        pid_list[pid_cnt++] = (int)parsed_pid;
+    if (capacity > (SIZE_MAX - 1U) / 32U) {
+        (void)fclose(file);
+        return -1;
     }
+    size_t buffer_size = capacity * 32U + 1U;
+    char *contents = calloc(buffer_size, 1U);
+    if (contents == NULL) {
+        (void)fclose(file);
+        return -1;
+    }
+    size_t used = fread(contents, 1, buffer_size - 1U, file);
+    if (ferror(file) != 0 || (!feof(file) && used == buffer_size - 1U)) {
+        log_error("failed or oversized read from %s", cgroup_procs_path);
+        free(contents);
+        (void)fclose(file);
+        return -1;
+    }
+    (void)fclose(file);
 
-    fclose(file);
-    return pid_cnt;
+    char error[160] = {0};
+    size_t pid_count = 0U;
+    if (td_parse_cgroup_pid_list(contents, pid_list, capacity, &pid_count,
+                                 error, sizeof(error)) != 0 ||
+        pid_count > (size_t)INT_MAX) {
+        log_error("invalid cgroup process list %s: %s", cgroup_procs_path, error);
+        free(contents);
+        return -1;
+    }
+    free(contents);
+    return (int)pid_count;
 }
 
 

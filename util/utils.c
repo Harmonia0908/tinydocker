@@ -17,6 +17,7 @@
 #include "../logger/log.h"
 #include "../core/fs.h"
 #include "../core/process.h"
+#include "../core/safety.h"
 
 
 
@@ -176,6 +177,27 @@ int create_tar(char *dir, char *tar_path) {
 
 
 int extract_tar(const char* tar_file, const char* extract_dir) {
+    char *listing = NULL;
+    size_t listing_size = 0U;
+    char *const list_arguments[] = {"tar", "-tf", (char *)tar_file, NULL};
+    if (td_capture_command(list_arguments, &listing, &listing_size) != 0) {
+        free(listing);
+        log_error("failed to list archive before extraction: %s", tar_file);
+        return -1;
+    }
+    (void)listing_size;
+    char *save = NULL;
+    char *entry = strtok_r(listing, "\n", &save);
+    while (entry != NULL) {
+        if (td_archive_entry_is_safe(entry) == 0) {
+            log_error("refusing unsafe archive entry: %s", entry);
+            free(listing);
+            return -1;
+        }
+        entry = strtok_r(NULL, "\n", &save);
+    }
+    free(listing);
+
     char *const arguments[] = {"tar", "-xf", (char *)tar_file, "-C",
                                (char *)extract_dir, "--no-same-owner",
                                "--no-same-permissions", NULL};

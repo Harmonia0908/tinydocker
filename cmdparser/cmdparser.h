@@ -129,7 +129,7 @@ struct docker_network_connect {
 
 
 
-struct volume_config parse_volume_config(char* input);
+struct volume_config parse_volume_config(const char *input);
 struct docker_cmd parse_docker_cmd(int argc, char *argv[]);
 void print_docker_cmds(struct docker_cmd);
 

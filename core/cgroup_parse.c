@@ -1,8 +1,10 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "cgroup_parse.h"
+#include "safety.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -109,5 +111,46 @@ int td_format_bytes(const char *raw, char *output, size_t output_size,
         set_error(error, error_size, "formatted byte value is too long");
         return -1;
     }
+    return 0;
+}
+
+int td_parse_cgroup_pid_list(const char *contents, int *pid_list,
+                             size_t capacity, size_t *pid_count,
+                             char *error, size_t error_size)
+{
+    char *copy;
+    char *save = NULL;
+    char *line;
+    size_t count = 0U;
+
+    if (contents == NULL || pid_list == NULL || capacity == 0U ||
+        pid_count == NULL) {
+        set_error(error, error_size, "invalid cgroup pid list input");
+        return -1;
+    }
+    copy = strdup(contents);
+    if (copy == NULL) {
+        set_error(error, error_size, "out of memory parsing cgroup pid list");
+        return -1;
+    }
+    line = strtok_r(copy, "\n", &save);
+    while (line != NULL) {
+        long parsed = 0;
+        if (count >= capacity) {
+            free(copy);
+            set_error(error, error_size, "cgroup pid list exceeds capacity %zu",
+                      capacity);
+            return -1;
+        }
+        if (td_parse_long(line, 1, INT_MAX, &parsed,
+                          error, error_size) != 0) {
+            free(copy);
+            return -1;
+        }
+        pid_list[count++] = (int)parsed;
+        line = strtok_r(NULL, "\n", &save);
+    }
+    free(copy);
+    *pid_count = count;
     return 0;
 }

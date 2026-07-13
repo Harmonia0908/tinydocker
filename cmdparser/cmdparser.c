@@ -10,7 +10,7 @@
 #define DOCKER_RUN_OPTION_CAPACITY 128
 #define DOCKER_RUN_ARG_CAPACITY 128
 
-struct key_val_pair parse_key_val_pair(char *str, const char *spliter) {
+static struct key_val_pair parse_key_val_pair(char *str, const char *spliter) {
     struct key_val_pair pair = {NULL, NULL};
 
     char *token = strtok(str, spliter);
@@ -26,7 +26,7 @@ struct key_val_pair parse_key_val_pair(char *str, const char *spliter) {
 }
 
 // 打印帮助信息
-void print_cmd_help(const struct argp *argp) {
+static void print_cmd_help(const struct argp *argp) {
     if (argp->args_doc != NULL) {
         printf("%s\n", argp->args_doc);
     }
@@ -40,23 +40,23 @@ void print_cmd_help(const struct argp *argp) {
 
 /*====================docker run命令行======================*/
 //参数说明
-char *docker_run_doc = "Usage:  tinydocker run [OPTIONS] IMAGE [COMMAND] [ARG...]";
+static const char *docker_run_doc = "Usage:  tinydocker run [OPTIONS] IMAGE [COMMAND] [ARG...]";
 
 //参数配置
-struct argp_option docker_run_option_setting[] = {	
+static const struct argp_option docker_run_option_setting[] = {
     //{"--长参数", "-缩写参数", '提示值: --file=提示值', "flag", "说明文档" }
-    { "volume",      'v', "k:v",        0, "设置卷" },
-    { "name",        'n', "str",        0, "容器名字"},
-    { "detach",      'd', "false|true", OPTION_ARG_OPTIONAL, "容器后台运行" },
-    { "interactive", 'i', "false|true", OPTION_ARG_OPTIONAL, "开启交互模式" },
-    { "cpu-shares",  'c', "int_val",    0, "设置cpu限制, 必须大于1000" },
-    { "memory",      'm', "int_val",    0, "设置内存限制" },
-    { "env",         'e', "int_val",    0, "环境变量" },
-    { "port",        'p', "k:v int",        0, "设置端口映射" },
+    { "volume",      'v', "k:v",        0, "设置卷", 0 },
+    { "name",        'n', "str",        0, "容器名字", 0 },
+    { "detach",      'd', "false|true", OPTION_ARG_OPTIONAL, "容器后台运行", 0 },
+    { "interactive", 'i', "false|true", OPTION_ARG_OPTIONAL, "开启交互模式", 0 },
+    { "cpu-shares",  'c', "int_val",    0, "设置cpu限制, 必须大于1000", 0 },
+    { "memory",      'm', "int_val",    0, "设置内存限制", 0 },
+    { "env",         'e', "int_val",    0, "环境变量", 0 },
+    { "port",        'p', "k:v int",    0, "设置端口映射", 0 },
     { 0 }
 };
 
-struct volume_config parse_volume_config(char* input) {
+struct volume_config parse_volume_config(const char *input) {
     struct volume_config result;
     char path_check[TINYDOCKER_MAX_VOLUME_PATH + 16] = {0};
     char error[160] = {0};
@@ -179,7 +179,7 @@ static error_t docker_run_parse_func(int key, char *arg, struct argp_state *stat
         case 'n':
             arguments->name =arg;
             break;
-        case 'e':
+        case 'e': {
             if (arguments->env_cnt >= DOCKER_RUN_OPTION_CAPACITY) {
                 printf("too many env variables, max is %d\n", DOCKER_RUN_OPTION_CAPACITY);
                 exit(-1);
@@ -191,6 +191,7 @@ static error_t docker_run_parse_func(int key, char *arg, struct argp_state *stat
             }
             arguments->env[arguments->env_cnt++] = env_pair;
             break;
+        }
         case ARGP_KEY_ARG:
             arguments->image = arg;
             for (int i = state->next; i < state->argc; i++) {
@@ -205,7 +206,7 @@ static error_t docker_run_parse_func(int key, char *arg, struct argp_state *stat
     return 0;
 }
 
-int docker_run_cmd_check(struct docker_run_arguments *a) {
+static int docker_run_cmd_check(struct docker_run_arguments *a) {
     if (a->detach == 1 && a->interactive == 1) {
         printf("ERROR: -d can not use with -t -i together\n");
         return 0;
@@ -217,7 +218,7 @@ int docker_run_cmd_check(struct docker_run_arguments *a) {
 }
 
 // 打印命令参数
-void docker_run_cmd_print(struct docker_run_arguments *a) {
+static void docker_run_cmd_print(struct docker_run_arguments *a) {
     printf("interactive=%d\n", a->interactive);
     printf("detach=%d\n", a->detach);
     printf("cpu=%d\n", a->cpu);
@@ -246,15 +247,15 @@ void docker_run_cmd_print(struct docker_run_arguments *a) {
 
 // ==============================docker exec===========================
 //参数说明
-char *docker_exec_doc = "Usage:  tinydocker exec [OPTIONS] CONTAINER COMMAND [ARG...]";
+static const char *docker_exec_doc = "Usage:  tinydocker exec [OPTIONS] CONTAINER COMMAND [ARG...]";
 
 //参数配置
-struct argp_option docker_exec_option_setting[] = {	
+static const struct argp_option docker_exec_option_setting[] = {
     //{"--长参数", "-缩写参数", '提示值: --file=提示值', "flag", "说明文档" }
-    { "detach",      'd', "false|true", OPTION_ARG_OPTIONAL, "后台运行" },
-    { "interactive", 'i', "false|true", OPTION_ARG_OPTIONAL, "开启交互模式" },
-    { "tty",         't', "false|true", OPTION_ARG_OPTIONAL, "开启tty" },
-    { "env",         'e', "k=v", 0, "环境变量" },
+    { "detach",      'd', "false|true", OPTION_ARG_OPTIONAL, "后台运行", 0 },
+    { "interactive", 'i', "false|true", OPTION_ARG_OPTIONAL, "开启交互模式", 0 },
+    { "tty",         't', "false|true", OPTION_ARG_OPTIONAL, "开启tty", 0 },
+    { "env",         'e', "k=v", 0, "环境变量", 0 },
     { 0 }
 };
 
@@ -275,12 +276,26 @@ static error_t docker_exec_parse_func(int key, char *arg, struct argp_state *sta
         case 't':
             arguments->tty = 1;
             break;
-        case 'e':
-            arguments->env[arguments->env_cnt++] = parse_key_val_pair(arg, "=");
+        case 'e': {
+            if (arguments->env_cnt >= 128) {
+                printf("too many exec environment variables, max is 128\n");
+                exit(-1);
+            }
+            struct key_val_pair pair = parse_key_val_pair(arg, "=");
+            if (pair.key == NULL || pair.val == NULL) {
+                printf("invalid environment variable; expected KEY=VALUE\n");
+                exit(-1);
+            }
+            arguments->env[arguments->env_cnt++] = pair;
             break;
+        }
         case ARGP_KEY_ARG:
             arguments->container_name = arg;
             for (int i = state->next; i < state->argc; i++) {
+                if (arguments->container_argc >= 127) {
+                    printf("too many exec command arguments, max is 127\n");
+                    exit(-1);
+                }
                 arguments->container_argv[arguments->container_argc++] = state->argv[i];  
             }
             arguments->container_argv[arguments->container_argc] = NULL;
@@ -289,7 +304,7 @@ static error_t docker_exec_parse_func(int key, char *arg, struct argp_state *sta
 }
 
 // 打印命令参数
-void docker_exec_cmd_print(struct docker_exec_arguments *a) {
+static void docker_exec_cmd_print(struct docker_exec_arguments *a) {
     printf("interactive=%d\n", a->interactive);
     printf("tty=%d\n", a->tty);
     printf("detach=%d\n", a->detach);
@@ -307,32 +322,27 @@ void docker_exec_cmd_print(struct docker_exec_arguments *a) {
 
 
 // ==============================docker commit===========================
-void docker_commit_cmd_print(struct docker_commit_arguments *a) {
+static void docker_commit_cmd_print(struct docker_commit_arguments *a) {
     printf("container_name=%s\n", a->container_name);
     printf("tar_path=%s\n", a->tar_path != NULL ? a->tar_path : "");
 }
 
 
 // ==============================docker ps===========================
-void docker_ps_cmd_print(struct docker_ps_arguments *a) {
+static void docker_ps_cmd_print(struct docker_ps_arguments *a) {
     printf("list_all=%d\n", a->list_all);
 }
 
 
 // ==============================docker top===========================
-void docker_top_cmd_print(struct docker_top_arguments *a) {
-    printf("container=%s\n", a->container_name);
-}
-
-
 // ==============================docker stop===========================
 
 //参数说明
-char *docker_stop_doc = "Usage:  docker stop [OPTIONS] CONTAINER [CONTAINER...]";
+static const char *docker_stop_doc = "Usage:  docker stop [OPTIONS] CONTAINER [CONTAINER...]";
 
 //参数配置
-struct argp_option docker_stop_option_setting[] = {	
-    { "time",       't', "int > 0", 0, "等待多少秒后发送SIGKILL信号" },
+static const struct argp_option docker_stop_option_setting[] = {
+    { "time",       't', "int > 0", 0, "等待多少秒后发送SIGKILL信号", 0 },
     { 0 }
 };
 
@@ -364,7 +374,7 @@ static error_t docker_stop_parse_func(int key, char *arg, struct argp_state *sta
     return 0;
 }
 
-void docker_stop_cmd_print(struct docker_stop_arguments *a) {
+static void docker_stop_cmd_print(struct docker_stop_arguments *a) {
     printf("container_cnt=%d\n", a->container_cnt);
     printf("wait_time=%d\n", a->time);
     for (int i = 0; i < a->container_cnt; i++) {
@@ -373,7 +383,7 @@ void docker_stop_cmd_print(struct docker_stop_arguments *a) {
 }
 
 // ==============================docker rm===========================
-void docker_rm_cmd_print(struct docker_rm_arguments *a) {
+static void docker_rm_cmd_print(struct docker_rm_arguments *a) {
     printf("container_cnt=%d\n", a->container_cnt);
     for (int i = 0; i < a->container_cnt; i++) {
         printf("%s\n", a->containers[i]);
@@ -382,7 +392,7 @@ void docker_rm_cmd_print(struct docker_rm_arguments *a) {
 
 
 // ==============================docker network rm===========================
-void docker_network_rm_cmd_print(struct docker_network_rm *a) {
+static void docker_network_rm_cmd_print(struct docker_network_rm *a) {
     printf("network_cnt=%d\n", a->network_argc);
     for (int i = 0; i < a->network_argc; i++) {
         printf("%s\n", a->network_argv[i]);
@@ -390,7 +400,7 @@ void docker_network_rm_cmd_print(struct docker_network_rm *a) {
 }
 
 // ==============================docker network create===========================
-void docker_network_create_cmd_print(struct docker_network_create *a) {
+static void docker_network_create_cmd_print(struct docker_network_create *a) {
     printf("name=%s\n", a->name);
     printf("cidr=%s\n", a->cider);
 }
@@ -423,7 +433,11 @@ struct docker_cmd parse_docker_cmd(int argc, char *argv[]) {
     }
     char *action = argv[1];
     if (strcmp(action, "run") == 0) {
-        struct argp docker_run_argp = {docker_run_option_setting, docker_run_parse_func, docker_run_doc, NULL};
+        struct argp docker_run_argp = {
+            .options = docker_run_option_setting,
+            .parser = docker_run_parse_func,
+            .args_doc = docker_run_doc
+        };
         struct docker_run_arguments *arguments = (struct docker_run_arguments *) malloc(sizeof(struct docker_run_arguments));
         arguments->volume_cnt = 0;
         arguments->volumes = (struct volume_config *) malloc(DOCKER_RUN_OPTION_CAPACITY * sizeof(struct volume_config));
@@ -508,7 +522,11 @@ struct docker_cmd parse_docker_cmd(int argc, char *argv[]) {
     }
 
     if (strcmp(action, "exec") == 0) {
-        struct argp docker_exec_argp = {docker_exec_option_setting, docker_exec_parse_func, docker_exec_doc, NULL};
+        struct argp docker_exec_argp = {
+            .options = docker_exec_option_setting,
+            .parser = docker_exec_parse_func,
+            .args_doc = docker_exec_doc
+        };
         struct docker_exec_arguments *arguments = (struct docker_exec_arguments *) malloc(sizeof(struct docker_exec_arguments));
         arguments->detach = 0;
         arguments->interactive = 0;
@@ -537,7 +555,11 @@ struct docker_cmd parse_docker_cmd(int argc, char *argv[]) {
             exit(-1);
         }
        
-        struct argp docker_stop_argp = {docker_stop_option_setting, docker_stop_parse_func, docker_stop_doc, NULL};
+        struct argp docker_stop_argp = {
+            .options = docker_stop_option_setting,
+            .parser = docker_stop_parse_func,
+            .args_doc = docker_stop_doc
+        };
         struct docker_stop_arguments *arguments = (struct docker_stop_arguments *) malloc(sizeof(struct docker_stop_arguments));
         arguments->time = 10;
         arguments->container_cnt = 0;

@@ -324,3 +324,18 @@ int td_make_veth_name(const char *container_name, char *output,
                        (unsigned int)(hash & UINT32_C(0x00ffffff)));
     return written == 15 ? 0 : -1;
 }
+
+int td_archive_entry_is_safe(const char *entry_name)
+{
+    if (entry_name == NULL || entry_name[0] == '\0' || entry_name[0] == '/' ||
+        strchr(entry_name, '\n') != NULL || strchr(entry_name, '\r') != NULL) {
+        return 0;
+    }
+    while (entry_name[0] == '.' && entry_name[1] == '/') {
+        entry_name += 2;
+    }
+    if (entry_name[0] == '\0') {
+        return 1;
+    }
+    return has_unsafe_path_component(entry_name) == 0 ? 1 : 0;
+}

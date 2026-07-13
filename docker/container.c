@@ -6,6 +6,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <sys/mount.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <signal.h>
@@ -25,6 +26,14 @@
 
 extern char **environ;
 static int pipe_fd[2];
+static volatile sig_atomic_t foreground_child_pid = -1;
+
+static void forward_signal_to_container(int signal_number) {
+    pid_t child = (pid_t)foreground_child_pid;
+    if (child > 0) {
+        (void)kill(child, signal_number);
+    }
+}
 
 int init_runtime_dirs(void) {
     const char *directories[] = {
@@ -46,7 +55,7 @@ int init_runtime_dirs(void) {
 }
 
 //初始化 run 所需目录和宿主机网络；只读命令不得调用。
-int init_docker_env() {
+int init_docker_env(void) {
     if (init_runtime_dirs() != 0) {
         return -1;
     }
@@ -75,19 +84,48 @@ int init_docker_env() {
     return 0;
 }
 
-int container_exists(char *container_name) {
-    //容器状态文件
-    char status_path[1024] = {0};
-    sprintf(status_path, "%s/container_info/%s", TINYDOCKER_RUNTIME_DIR, container_name);
+static int build_container_runtime_paths(const char *container_name,
+                                         char *container_dir,
+                                         size_t container_dir_size,
+                                         char *mountpoint,
+                                         size_t mountpoint_size,
+                                         char *status_path,
+                                         size_t status_path_size) {
+    char error[160] = {0};
+    int written;
+
+    if (td_build_named_path(TINYDOCKER_RUNTIME_DIR, "containers", container_name,
+                            container_dir, container_dir_size,
+                            error, sizeof(error)) != 0 ||
+        td_build_named_path(TINYDOCKER_RUNTIME_DIR, "container_info", container_name,
+                            status_path, status_path_size,
+                            error, sizeof(error)) != 0) {
+        log_error("failed to build container runtime path: %s", error);
+        return -1;
+    }
+    written = snprintf(mountpoint, mountpoint_size, "%s/mountpoint", container_dir);
+    if (written < 0 || (size_t)written >= mountpoint_size) {
+        log_error("container mountpoint path is too long: %s", container_name);
+        return -1;
+    }
+    return 0;
+}
+
+static int container_exists(char *container_name) {
+    char status_path[PATH_MAX] = {0};
+    char container_dir[PATH_MAX] = {0};
+    char mountpoint[PATH_MAX] = {0};
+    if (build_container_runtime_paths(container_name, container_dir,
+                                      sizeof(container_dir), mountpoint,
+                                      sizeof(mountpoint), status_path,
+                                      sizeof(status_path)) != 0) {
+        return 1;
+    }
     //容器cgroup
     char cgroup_path[1024] = {0};
     if (get_container_cgroup_path(container_name, cgroup_path, sizeof(cgroup_path)) != 0) {
         return 1;
     }
-    //容器工作目录
-    char container_dir[256] = {0};
-    sprintf(container_dir, "%s/containers/%s", TINYDOCKER_RUNTIME_DIR, container_name);
-
     // 检查容器是否已经存在, 已经存在就报错
     if (path_exist(cgroup_path) || path_exist(status_path) || path_exist(container_dir)) {
         return 1;
@@ -95,70 +133,88 @@ int container_exists(char *container_name) {
     return 0;
 }
 
-void clean_container_runtime(char *container_name) {
-    if (!container_exists(container_name)) {
-        return;
-    }
-    //删除cgroup文件
-    if (remove_cgroup(container_name) != 0) {
-        log_error("failed remove cgroup: %s", container_name);
-        perror("failed remove cgroup");
-    }
-    log_info("finish clean cgroup %s", container_name);
-
-    //构造挂载点
-    char mountpoint[1024] = {0};
-    sprintf(mountpoint, "%s/containers/%s/mountpoint", TINYDOCKER_RUNTIME_DIR, container_name);
-
-    //umount 挂载的卷
-    struct container_info info;
-    if (read_container_info(container_name, &info) != 0) {
-        log_error("failed read container info: %s", container_name);
-        return;
-    }
+static int clean_container_runtime(char *container_name,
+                                   const struct container_info *info) {
+    char status_path[PATH_MAX] = {0};
+    char container_dir[PATH_MAX] = {0};
+    char mountpoint[PATH_MAX] = {0};
     struct volume_config *volumes = NULL;
-    if (info.volume_cnt > 0) {
-        volumes = (struct volume_config *) malloc(sizeof(struct volume_config) * info.volume_cnt);
+    int volume_count = info == NULL ? 0 : info->volume_cnt;
+    int cleanup_failed = 0;
+    int mount_cleanup_failed = 0;
+
+    if (build_container_runtime_paths(container_name, container_dir,
+                                      sizeof(container_dir), mountpoint,
+                                      sizeof(mountpoint), status_path,
+                                      sizeof(status_path)) != 0) {
+        return -1;
+    }
+    if (volume_count > 0) {
+        volumes = calloc((size_t)volume_count, sizeof(*volumes));
         if (volumes == NULL) {
             log_error("failed alloc volume config buffer");
-            return;
+            return -1;
         }
-        for (int i = 0; i < info.volume_cnt; i++) { // 解析出挂载的卷列表
-            volumes[i] = parse_volume_config(info.volumes[i]);
+        for (int i = 0; i < volume_count; i++) {
+            volumes[i] = parse_volume_config(info->volumes[i]);
+            if (volumes[i].ro < 0) {
+                log_error("corrupt volume metadata for container %s", container_name);
+                free(volumes);
+                return -1;
+            }
         }
     }
-    umount_volumes(mountpoint, info.volume_cnt, volumes);
+
+    if (umount_volumes(mountpoint, volume_count, volumes) != 0) {
+        cleanup_failed = 1;
+        mount_cleanup_failed = 1;
+    }
     free(volumes);
-    log_info("finish unmount mounted volumes");
-
-    //umount 容器跟目录挂载点
-    umount(mountpoint);
-    log_info("finish unmount container mountpoint %s", mountpoint);
-
-    //清理容器工作目录
-    char container_dir[256] = {0};
-    sprintf(container_dir, "%s/containers/%s", TINYDOCKER_RUNTIME_DIR, container_name);
-    if (remove_dir(container_dir) == -1) {
-        log_error("clean container %s work dir error", container_dir);
+    if (umount(mountpoint) != 0 && errno != EINVAL && errno != ENOENT) {
+        log_error("failed to unmount container root %s: %s",
+                  mountpoint, strerror(errno));
+        cleanup_failed = 1;
+        mount_cleanup_failed = 1;
     }
-    log_info("finish clean container dir: %s", container_dir);
-
-    //释放占用的IP地址
-    release_used_ip(TINYDOCKER_DEFAULT_NETWORK_NAME, info.ip_addr);
-
-    //删除端口映射规则
-    unset_container_port_map(info.ip_addr);
-
-     // 删除状态文件
-    remove_status_info(container_name);
+    if (info != NULL && info->ip_addr[0] != '\0') {
+        if (unset_container_port_map((char *)info->ip_addr) != 0 ||
+            disconnect_container(container_name,
+                                 TINYDOCKER_DEFAULT_NETWORK_NAME) != 0 ||
+            release_used_ip(TINYDOCKER_DEFAULT_NETWORK_NAME,
+                            (char *)info->ip_addr) != 0) {
+            cleanup_failed = 1;
+        }
+    }
+    if (mount_cleanup_failed != 0) {
+        log_error("refusing to delete workspace while mounts may still be active: %s",
+                  container_dir);
+    } else if (remove_dir(container_dir) != 0) {
+        log_error("failed to remove container workspace %s: %s",
+                  container_dir, strerror(errno));
+        cleanup_failed = 1;
+    }
+    if (remove_cgroup(container_name) != 0) {
+        cleanup_failed = 1;
+    }
+    if (cleanup_failed == 0 && remove_status_info(container_name) != 0) {
+        log_error("failed to remove container metadata %s: %s",
+                  status_path, strerror(errno));
+        cleanup_failed = 1;
+    }
+    return cleanup_failed == 0 ? 0 : -1;
 }
 
 static void cleanup_run_failure(struct docker_run_arguments *args, char *mountpoint, char *ip_addr, pid_t child_pid, int pipe_created) {
+    int mount_cleanup_failed = 0;
     if (child_pid > 0) {
-        if (kill(child_pid, SIGKILL) != 0) {
+        pid_t waited;
+        if (kill(child_pid, SIGKILL) != 0 && errno != ESRCH) {
             log_warn("failed to kill container child process %d: %s", child_pid, strerror(errno));
         }
-        if (waitpid(child_pid, NULL, 0) == -1) {
+        do {
+            waited = waitpid(child_pid, NULL, 0);
+        } while (waited < 0 && errno == EINTR);
+        if (waited < 0 && errno != ECHILD) {
             log_warn("failed to wait container child process %d: %s", child_pid, strerror(errno));
         }
     }
@@ -186,17 +242,27 @@ static void cleanup_run_failure(struct docker_run_arguments *args, char *mountpo
         if (args->volume_cnt > 0 && args->volumes != NULL) {
             if (umount_volumes(mountpoint, args->volume_cnt, args->volumes) != 0) {
                 log_warn("failed to unmount container volumes: %s", mountpoint);
+                mount_cleanup_failed = 1;
             }
         }
-        if (umount(mountpoint) != 0) {
+        if (umount(mountpoint) != 0 && errno != EINVAL && errno != ENOENT) {
             log_warn("failed to unmount container mountpoint %s: %s", mountpoint, strerror(errno));
+            mount_cleanup_failed = 1;
         }
     }
 
-    char container_dir[256] = {0};
-    int path_len = snprintf(container_dir, sizeof(container_dir), "%s/containers/%s", TINYDOCKER_RUNTIME_DIR, args->name);
-    if (path_len < 0 || (size_t) path_len >= sizeof(container_dir)) {
+    char container_dir[PATH_MAX] = {0};
+    char ignored_mountpoint[PATH_MAX] = {0};
+    char ignored_status_path[PATH_MAX] = {0};
+    if (build_container_runtime_paths(args->name, container_dir,
+                                      sizeof(container_dir), ignored_mountpoint,
+                                      sizeof(ignored_mountpoint),
+                                      ignored_status_path,
+                                      sizeof(ignored_status_path)) != 0) {
         log_warn("container dir path too long, skip cleanup: %s", args->name);
+    } else if (mount_cleanup_failed != 0) {
+        log_warn("refusing workspace deletion while mounts may still be active: %s",
+                 container_dir);
     } else if (remove_dir(container_dir) != 0) {
         log_warn("failed to remove container workspace: %s", container_dir);
     }
@@ -205,59 +271,129 @@ static void cleanup_run_failure(struct docker_run_arguments *args, char *mountpo
         log_warn("failed to remove cgroup: %s", args->name);
     }
 
-    if (remove_status_info(args->name) != 0) {
+    if (mount_cleanup_failed != 0) {
+        log_warn("partial metadata kept because mount cleanup failed: %s",
+                 args->name);
+    } else if (remove_status_info(args->name) != 0) {
         log_warn("failed to remove partial container info: %s", args->name);
     }
 }
 
-char **load_process_env(int pid, struct key_val_pair *user_envs, int user_env_cnt) {
-    const int max_env_cnt = 256 + 1; //多一个放空指针
-    char **envs = (char **) malloc(sizeof(char *) * max_env_cnt); //最多支持max_env_cnt个环境变量
+static char **load_process_env(int pid, struct key_val_pair *user_envs, int user_env_cnt) {
+    enum { MAX_ENV_COUNT = 256, MAX_ENV_BYTES = 1024 * 1024 };
+    const int max_env_cnt = MAX_ENV_COUNT + 1;
+    char **envs = calloc((size_t)max_env_cnt, sizeof(*envs));
     int env_idx = 0;
+    if (envs == NULL || user_env_cnt < 0 ||
+        (user_env_cnt > 0 && user_envs == NULL)) {
+        free(envs);
+        return NULL;
+    }
 
     // 复制父进程的环境变量
     if (getpid() == pid) {  //获取当前进程自己的环境变量, 直接使用environ变量
-        for (int i = 0; env_idx < max_env_cnt && environ[i] != NULL; i++) {
+        for (int i = 0; env_idx < MAX_ENV_COUNT && environ[i] != NULL; i++) {
             envs[env_idx++] = environ[i];
         }
     } else {
-        char path[256];
-        sprintf(path, "/proc/%d/environ", pid);
-        int fd = open(path, O_RDONLY);
+        char path[256] = {0};
+        int path_length = snprintf(path, sizeof(path), "/proc/%d/environ", pid);
+        if (path_length < 0 || (size_t)path_length >= sizeof(path)) {
+            free(envs);
+            return NULL;
+        }
+        int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
         if (fd < 0) {
             log_error("failed to open environ file: %s, err:%s", path, strerror(errno));
-            return 0;
+            free(envs);
+            return NULL;
         }
 
-        int buf_size = 4096;
-        char buffer[buf_size];
-        int len = 0;
-        char kv_line[buf_size];
-        int kv_idx = 0;
-        while ((len = read(fd, buffer, buf_size)) > 0) {
-            for (int i = 0; i < len; i++) {
-                if (buffer[i] == '\0') { // envion文件形式为k1=v1\0k2=v2\0, 且一定有\0结尾, 所以这里能访问所有变量
-                    char *kv_pair = (char *) malloc(kv_idx + 2);
-                    strcpy(kv_pair, kv_line);
-                    envs[env_idx++] = kv_pair;
-                    memset(kv_line, 0, buf_size);
-                    kv_idx = 0;
-                } else {
-                    kv_line[kv_idx++] = buffer[i];
-                }
-            }
-            memset(buffer, 0, buf_size);
+        size_t capacity = 4096U;
+        size_t used = 0U;
+        char *contents = malloc(capacity);
+        if (contents == NULL) {
+            (void)close(fd);
+            free(envs);
+            return NULL;
         }
-        close(fd);
+        for (;;) {
+            if (used == capacity) {
+                size_t next_capacity = capacity * 2U;
+                char *larger;
+                if (next_capacity > MAX_ENV_BYTES) {
+                    log_error("environment for pid %d exceeds %d bytes",
+                              pid, MAX_ENV_BYTES);
+                    free(contents);
+                    (void)close(fd);
+                    free(envs);
+                    return NULL;
+                }
+                larger = realloc(contents, next_capacity);
+                if (larger == NULL) {
+                    free(contents);
+                    (void)close(fd);
+                    free(envs);
+                    return NULL;
+                }
+                contents = larger;
+                capacity = next_capacity;
+            }
+            ssize_t count = read(fd, contents + used, capacity - used);
+            if (count < 0 && errno == EINTR) {
+                continue;
+            }
+            if (count < 0) {
+                free(contents);
+                (void)close(fd);
+                free(envs);
+                return NULL;
+            }
+            if (count == 0) {
+                break;
+            }
+            used += (size_t)count;
+        }
+        (void)close(fd);
+        size_t start = 0U;
+        while (start < used && env_idx < MAX_ENV_COUNT) {
+            char *end = memchr(contents + start, '\0', used - start);
+            size_t length = end == NULL ? used - start :
+                (size_t)(end - (contents + start));
+            if (length > 0U) {
+                char *entry = malloc(length + 1U);
+                if (entry == NULL) {
+                    free(contents);
+                    free(envs);
+                    return NULL;
+                }
+                memcpy(entry, contents + start, length);
+                entry[length] = '\0';
+                envs[env_idx++] = entry;
+            }
+            start += length + (end == NULL ? 0U : 1U);
+            if (end == NULL) {
+                break;
+            }
+        }
+        free(contents);
     }
 
     // 复制用户设置的环境变量
-    for (int i = 0; env_idx < max_env_cnt && i < user_env_cnt; i++) {
+    for (int i = 0; env_idx < MAX_ENV_COUNT && i < user_env_cnt; i++) {
         char *key = user_envs[i].key;
         char *val = user_envs[i].val;
-        char *env_kv = (char *) malloc(10 + strlen(key) + strlen(val));
-        strcpy(env_kv, "");
-        sprintf(env_kv, "%s=%s", key, val);
+        if (key == NULL || val == NULL) {
+            free(envs);
+            return NULL;
+        }
+        size_t env_length = strlen(key) + strlen(val) + 2U;
+        char *env_kv = malloc(env_length);
+        if (env_kv == NULL) {
+            free(envs);
+            return NULL;
+        }
+        (void)snprintf(env_kv, env_length, "%s=%s", key, val);
         envs[env_idx++] = env_kv;
     }
     envs[env_idx] = NULL;
@@ -267,43 +403,62 @@ char **load_process_env(int pid, struct key_val_pair *user_envs, int user_env_cn
 
 static char child_stack[8 * 1024 * 1024];
 
-int child_fn(void *args) {
+static int child_fn(void *args) {
     struct docker_run_arguments *run_args = (struct docker_run_arguments *) args;
     //如果容器是后台运行, 将日志日志重定向到指定目录
     if (run_args->detach) {
-        char log_file_path[128] = {0};
-        sprintf(log_file_path, "%s/%s", CONTAINER_LOG_DIR, run_args->name);
+        char log_file_path[PATH_MAX] = {0};
+        int path_length = snprintf(log_file_path, sizeof(log_file_path), "%s/%s",
+                                   CONTAINER_LOG_DIR, run_args->name);
+        if (path_length < 0 || (size_t)path_length >= sizeof(log_file_path)) {
+            _exit(126);
+        }
         log_info("container log file: %s", log_file_path);
-        int fd = open(log_file_path, O_WRONLY | O_CREAT | O_TRUNC | O_SYNC, 0644); // 开启O_SYNC标志, 不要使用缓存
+        int fd = open(log_file_path,
+                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+                      S_IRUSR | S_IWUSR);
         if (fd < 0) {
             log_error("failed to open container log file: %s", log_file_path);
+            _exit(126);
         }
-        dup2(fd, 1);
-        dup2(fd, 2);
+        if (dup2(fd, STDOUT_FILENO) < 0 || dup2(fd, STDERR_FILENO) < 0) {
+            (void)close(fd);
+            _exit(126);
+        }
+        (void)close(fd);
     }
 
     // 为什么放在这个地方, 因为如果pivot_root后如果拿指定进程的环境变量就会报找不到文件了, 因为进入了容器里面, 但这里其实无所谓, 因为是拿当前进程自己的
     char **envs = load_process_env(getpid(), run_args->env, run_args->env_cnt);
+    if (envs == NULL) {
+        _exit(126);
+    }
 
     log_info("start init inner process");
     if (init_and_set_new_root(run_args->mountpoint) != 0) {
         log_error("init docker error");
-        exit(-1);
+        _exit(126);
     }
 
     //这里阻塞等收到父进程的命令后才开始运行, 为的是等待父进程设置cgroup
     close(pipe_fd[1]);
-    char input_buf[1024] = {0};
-    read(pipe_fd[0], input_buf, 1024);
+    char start_message = '\0';
+    ssize_t read_count;
+    do {
+        read_count = read(pipe_fd[0], &start_message, 1U);
+    } while (read_count < 0 && errno == EINTR);
     close(pipe_fd[0]);
+    if (read_count != 1 || start_message != '1') {
+        log_error("parent did not authorize container command start");
+        _exit(125);
+    }
 
     //开始运行用户命令
     char **cmds = (char **) run_args->container_argv;
     log_info("start to run %s", cmds[0]);
-    int ret = execve(cmds[0], cmds, envs);
-    if (ret != 0)
-        perror("exec error");
-    return 0;
+    execve(cmds[0], cmds, envs);
+    perror("exec error");
+    _exit(127);
 }
 
 int docker_run(struct docker_run_arguments *args) {
@@ -380,7 +535,7 @@ int docker_run(struct docker_run_arguments *args) {
     }
 
     //记录容器信息
-    int start_time = time(NULL);
+    time_t start_time = time(NULL);
     struct container_info info;
     if (create_container_info(args, child_pid, CONTAINER_RUNNING, ip_addr, start_time, &info) != 0) {
         log_error("failed to create container info for: %s", args->name);
@@ -393,30 +548,74 @@ int docker_run(struct docker_run_arguments *args) {
 
     //发送任意消息解除子进程的阻塞
     close(pipe_fd[0]);  //这里的关闭一定要放在创建子进程后面, 如果放在创建子进程前面, 由于继承关系,直接给子进程的读关闭了
-    char cmds[] = "start";
-    if (write(pipe_fd[1], cmds, strlen(cmds)) < 0) {
-        perror("write");
+    char start_message = '1';
+    ssize_t write_count;
+    do {
+        write_count = write(pipe_fd[1], &start_message, 1U);
+    } while (write_count < 0 && errno == EINTR);
+    if (write_count != 1) {
+        log_error("failed to release container child: %s", strerror(errno));
+        (void)close(pipe_fd[1]);
+        pipe_created = 0;
+        goto fail_cleanup_run;
     }
     close(pipe_fd[1]);
 
     // 如果配置了it任一参数, 等待容器退出
     if (args->detach == 1) {
         log_info("leave container process running in background");
+        free(mountpoint);
         return 0;
     }
 
-    int exit_status;
-    if (waitpid(child_pid, &exit_status, 0) == -1) {
-        perror("waitpid");
+    int exit_status = 0;
+    const int forwarded_signals[] = {SIGINT, SIGTERM, SIGHUP};
+    struct sigaction previous_actions[3];
+    int action_installed[3] = {0};
+    struct sigaction forward_action;
+    memset(&forward_action, 0, sizeof(forward_action));
+    forward_action.sa_handler = forward_signal_to_container;
+    (void)sigemptyset(&forward_action.sa_mask);
+    for (size_t index = 0U; index < 3U; index++) {
+        if (sigaction(forwarded_signals[index], &forward_action,
+                      &previous_actions[index]) != 0) {
+            log_warn("failed to install signal forwarding for %d: %s",
+                     forwarded_signals[index], strerror(errno));
+        } else {
+            action_installed[index] = 1;
+        }
+    }
+    foreground_child_pid = child_pid;
+    pid_t waited;
+    do {
+        waited = waitpid(child_pid, &exit_status, 0);
+    } while (waited < 0 && errno == EINTR);
+    foreground_child_pid = -1;
+    for (size_t index = 0U; index < 3U; index++) {
+        if (action_installed[index] != 0) {
+            (void)sigaction(forwarded_signals[index], &previous_actions[index], NULL);
+        }
+    }
+    if (waited < 0) {
+        log_error("waitpid failed for container %s: %s",
+                  args->name, strerror(errno));
+        free(mountpoint);
+        return -1;
     }
 
     if (WIFSIGNALED(exit_status)) { //容器进程被信号杀死
-        printf("constainer is killed by signal %d\n", WTERMSIG(exit_status));
+        printf("container was killed by signal %d\n", WTERMSIG(exit_status));
     } else { //正常退出
         log_info("container process exit");
-        update_container_status(args->name, CONTAINER_EXITED);
     }
-    return 0;
+    if (update_container_status(args->name, CONTAINER_EXITED) != 0) {
+        log_warn("failed to persist EXITED status for %s", args->name);
+    }
+    free(mountpoint);
+    if (WIFEXITED(exit_status)) {
+        return WEXITSTATUS(exit_status);
+    }
+    return 128 + WTERMSIG(exit_status);
 
 fail_cleanup_run:
     cleanup_run_failure(args, mountpoint, ip_addr, child_pid, pipe_created);
@@ -467,20 +666,20 @@ int docker_ps(struct docker_ps_arguments *args) {
         if (args->list_all == 0 && strcmp(info_list[i].status, "RUNNING") != 0) {
             continue;
         }
-        ssize_t container_id_len = strlen(info_list[i].container_id);
-        spans[0] = container_id_len > spans[0] ? container_id_len : spans[0];
+        size_t container_id_len = strlen(info_list[i].container_id);
+        spans[0] = container_id_len > (size_t)spans[0] ? (int)container_id_len : spans[0];
 
-        ssize_t image_len = strlen(info_list[i].image);
-        spans[1] = image_len > spans[1] ? image_len : spans[1];
+        size_t image_len = strlen(info_list[i].image);
+        spans[1] = image_len > (size_t)spans[1] ? (int)image_len : spans[1];
 
-        ssize_t command_len = strlen(info_list[i].command);
-        spans[2] = command_len > spans[2] ? command_len : spans[2];
+        size_t command_len = strlen(info_list[i].command);
+        spans[2] = command_len > (size_t)spans[2] ? (int)command_len : spans[2];
 
         spans[3] = 19; //2023-12-12 12:12:12这样的形式, 固定19长度
         spans[4] = 7; //RUNING|STOPPING|EXITED, 最长7
 
-        ssize_t name_len = strlen(info_list[i].name);
-        spans[5] = name_len > spans[5] ? name_len : spans[5];
+        size_t name_len = strlen(info_list[i].name);
+        spans[5] = name_len > (size_t)spans[5] ? (int)name_len : spans[5];
     }
 
     for (int i = 0; titles[i] != NULL; i++) {
@@ -538,47 +737,14 @@ int docker_top(struct docker_top_arguments *args) {
 
 
 int docker_exec(struct docker_exec_arguments *args) {
-    int current_pid = getpid();
-    // 获取当前进程的cgroup路径， 用户还原父进程的cgroup, 否则当前运行进程也加入到了容器内部的cgroup
-    char *cgroup_files[64];
-    int cgroup_file_cnt = get_cgroup_files(current_pid, cgroup_files, 64);
-    if (cgroup_file_cnt < 0) {
-        log_error("failed to get current prcess cgroup, pid=%d", current_pid);
-        exit(-1);
+    struct container_info info;
+    if (read_container_info(args->container_name, &info) != 0 ||
+        refresh_container_status_if_needed(args->container_name, &info) < 0 ||
+        strcmp(info.status, "RUNNING") != 0) {
+        log_error("container %s is not running", args->container_name);
+        return -1;
     }
 
-    //启动第一个进程用来在启动用户程序后户还原当前exec进程本身的cgroup
-    int pipe_fd[2];
-    pipe(pipe_fd);
-    int pid = fork();
-    if (pid < 0) {
-        exit(-1);
-    } else if (pid == 0) {
-        close(pipe_fd[1]);
-        char read_buf[128] = {0};
-        int len = read(pipe_fd[0], read_buf, 128); //如果父进程处理遇到错误会直接退出关闭管道，然后这里读的数据就是0，需要特殊处理
-        log_info("cgroup help prcess get message: %s, message_len: %d", read_buf, len);
-        //移除父进程的cgroup
-        if (len > 0) {
-            char procs[128] = {0};
-            sprintf(procs, "%s/%s", cgroup_files[0], "cgroup.procs");
-            if (write_pid_to_cgroup_procs(current_pid, procs) == -1) {
-                log_error("failed to moved out docker exec pid %d from new cgroup setting", current_pid);
-            } else {
-                log_info("docker exec pid %d moved out from new cgroup setting", current_pid);
-            }
-        }
-        log_info("parrent process exit, exit myself, pid=%d", current_pid);
-        exit(0);
-    }
-
-    // 先设置cgroup好让子进程继承, 不然在绑定了命名空间后会提示找不到cgroup文件
-    if (apply_cgroup_limit_to_pid(args->container_name, current_pid) == -1) {
-        log_error("failed to set cgroup limits");
-        exit(-1);
-    }
-
-    // 找出目标容器中的一个进程ID, 该进程用来寻找ns文件
     int pid_list[4096];
     int pid_cnt = get_container_processes_id(args->container_name, pid_list,
                                              sizeof(pid_list) / sizeof(pid_list[0]));
@@ -586,116 +752,253 @@ int docker_exec(struct docker_exec_arguments *args) {
         log_error("failed to get container process list");
         return -1;
     }
-    //默认第一个进程为1号进程, 可能不准, 但是在我们这个简单环境下基本都是它了
-    int one_pid = pid_list[0];
-
-    // 记录容器1号进程的环境变量
-    char **envs = load_process_env(one_pid, args->env, args->env_cnt);
-
-    //设置当前主进程的命名空间    
-    //CLONE_NEWUTS | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWIPC
-    char ns_file[1024];
-    char *ns_typs[] = {"ipc", "uts", "net", "pid", "mnt", NULL}; 
-    for (int i = 0; ns_typs[i] != NULL; i++) {
-        // /proc/25032/ns/
-        strcpy(ns_file, ""); //清空字符串
-        sprintf(ns_file, "/proc/%d/ns/%s", one_pid, ns_typs[i]);
-        int fd = open(ns_file, O_RDONLY | O_CLOEXEC);
-        if (fd == -1 || setns(fd, 0) == -1) { // Join that namespace 
-            log_error("failed to join current process to destinct %s ns", ns_typs[i]);
-            exit(-1);
+    int target_is_member = 0;
+    for (int index = 0; index < pid_cnt; index++) {
+        if (pid_list[index] == info.pid) {
+            target_is_member = 1;
+            break;
         }
-        close(fd);
     }
-    
-    // 创建一个子进程运行用户程序
-    pid = fork();
-    if (pid < 0) {
-        log_error("failed to create subprocess");
-        exit(1);
-    } else if (pid == 0) { //子进程
-        printf("run %s\n", args->container_argv[0]);
-        if (execve(args->container_argv[0], args->container_argv, envs) == -1) {  //Execute a command in namespace 
-            log_error("failed to run cmd: %s", args->container_argv[0]);
-        }
-        exit(0);
-    } else { // 父进程
-        close(pipe_fd[0]);
-        char buf[100] = "remove_crgroup";
-        write(pipe_fd[1], buf, strlen(buf));
-        close(pipe_fd[1]);
-
-        if (args->detach == 0) {
-            log_info("docker exec waiting user command to finish now, user cmd pid=%d", pid);
-            waitpid(pid, NULL, 0);  // 等待子进程结束
-        }
-        log_info("docker exec finished");
+    if (target_is_member == 0) {
+        log_error("container init pid %d is not in its cgroup", info.pid);
+        return -1;
     }
 
-    return 0;
+    char **envs = load_process_env(info.pid, args->env, args->env_cnt);
+    if (envs == NULL) {
+        return -1;
+    }
+
+    pid_t namespace_worker = fork();
+    if (namespace_worker < 0) {
+        log_error("failed to fork namespace worker: %s", strerror(errno));
+        return -1;
+    }
+    if (namespace_worker == 0) {
+        const char *namespace_types[] = {"ipc", "uts", "net", "mnt", "pid", NULL};
+        int namespace_fds[5] = {-1, -1, -1, -1, -1};
+
+        if (apply_cgroup_limit_to_pid(args->container_name, getpid()) != 0) {
+            _exit(125);
+        }
+        for (size_t index = 0U; index < 5U; index++) {
+            char namespace_path[128] = {0};
+            int path_length = snprintf(namespace_path, sizeof(namespace_path),
+                                       "/proc/%d/ns/%s", info.pid,
+                                       namespace_types[index]);
+            if (path_length < 0 || (size_t)path_length >= sizeof(namespace_path)) {
+                for (size_t opened = 0U; opened < index; opened++) {
+                    (void)close(namespace_fds[opened]);
+                }
+                _exit(125);
+            }
+            namespace_fds[index] = open(namespace_path, O_RDONLY | O_CLOEXEC);
+            if (namespace_fds[index] < 0) {
+                for (size_t opened = 0U; opened < index; opened++) {
+                    (void)close(namespace_fds[opened]);
+                }
+                _exit(125);
+            }
+        }
+        for (size_t index = 0U; index < 5U; index++) {
+            int setns_result = setns(namespace_fds[index], 0);
+            int saved_errno = errno;
+            (void)close(namespace_fds[index]);
+            if (setns_result != 0) {
+                for (size_t remaining = index + 1U; remaining < 5U; remaining++) {
+                    (void)close(namespace_fds[remaining]);
+                }
+                log_error("failed to join %s namespace: %s",
+                          namespace_types[index], strerror(saved_errno));
+                _exit(125);
+            }
+        }
+        if (chdir("/") != 0) {
+            _exit(125);
+        }
+
+        pid_t command_pid = fork();
+        if (command_pid < 0) {
+            _exit(125);
+        }
+        if (command_pid == 0) {
+            execve(args->container_argv[0], args->container_argv, envs);
+            _exit(127);
+        }
+        if (args->detach != 0) {
+            _exit(0);
+        }
+        int command_status = 0;
+        pid_t waited;
+        do {
+            waited = waitpid(command_pid, &command_status, 0);
+        } while (waited < 0 && errno == EINTR);
+        if (waited < 0) {
+            _exit(125);
+        }
+        if (WIFEXITED(command_status)) {
+            _exit(WEXITSTATUS(command_status));
+        }
+        _exit(128 + WTERMSIG(command_status));
+    }
+
+    int worker_status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(namespace_worker, &worker_status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited < 0) {
+        log_error("failed to wait namespace worker: %s", strerror(errno));
+        return -1;
+    }
+    if (WIFEXITED(worker_status)) {
+        int exit_code = WEXITSTATUS(worker_status);
+        if (exit_code != 0) {
+            log_error("exec command failed with exit code %d", exit_code);
+        }
+        return exit_code;
+    }
+    return 128 + WTERMSIG(worker_status);
+}
+
+static int container_process_count(const char *container_name,
+                                   int *pid_list, size_t capacity) {
+    char cgroup_path[PATH_MAX] = {0};
+    char procs_path[PATH_MAX] = {0};
+    int written;
+
+    if (get_container_cgroup_path(container_name, cgroup_path,
+                                  sizeof(cgroup_path)) != 0) {
+        return -1;
+    }
+    written = snprintf(procs_path, sizeof(procs_path), "%s/cgroup.procs",
+                       cgroup_path);
+    if (written < 0 || (size_t)written >= sizeof(procs_path)) {
+        return -1;
+    }
+    if (!path_exist(procs_path)) {
+        return 0;
+    }
+    return get_container_processes_id(container_name, pid_list, capacity);
+}
+
+static int signal_container_processes(const char *container_name,
+                                      int signal_number) {
+    int pid_list[1024];
+    int pid_count = container_process_count(container_name, pid_list,
+                                            sizeof(pid_list) / sizeof(pid_list[0]));
+    int result = 0;
+
+    if (pid_count < 0) {
+        return -1;
+    }
+    for (int index = 0; index < pid_count; index++) {
+        if (pid_list[index] <= 0) {
+            result = -1;
+            continue;
+        }
+        if (kill(pid_list[index], signal_number) != 0 && errno != ESRCH) {
+            log_error("failed to signal pid %d in container %s: %s",
+                      pid_list[index], container_name, strerror(errno));
+            result = -1;
+        }
+    }
+    return result;
 }
 
 int docker_stop(struct docker_stop_arguments *args) {
-    for (int c = 0; c < args->container_cnt; c++) {
-        char *container_name = args->container_names[c];
-        int pid_list[1024];
-        int pid_cnt = get_container_processes_id(container_name, pid_list,
-                                                 sizeof(pid_list) / sizeof(pid_list[0]));
-        for (int p = 0; p < pid_cnt; p++) {
-            int ret = kill(pid_list[p], SIGTERM);
-            log_info("send SIGTERM to pid %d in container %s ret %d", pid_list[p], container_name, ret);
-        }
-    }
+    int overall_result = 0;
+    const struct timespec poll_interval = {.tv_sec = 0, .tv_nsec = 100000000L};
 
-    if (args->time > 0) {
-        log_info("wait %d seconds to send SIGKILL", args->time);
-        sleep(args->time); //睡眠等待时间, 如果还有容器进程没有停止, 直接kill掉
-        for (int c = 0; c < args->container_cnt; c++) {
-            char *container_name = args->container_names[c];
-            int pid_list[1024];
-            int pid_cnt = get_container_processes_id(container_name, pid_list,
-                                                     sizeof(pid_list) / sizeof(pid_list[0]));
-            for (int p = 0; p < pid_cnt; p++) {
-                int ret = kill(pid_list[p], SIGKILL);
-                log_info("send SIGKILL to pid %d in container %s ret %d", pid_list[p], container_name, ret);
+    for (int index = 0; index < args->container_cnt; index++) {
+        char *container_name = args->container_names[index];
+        struct container_info info;
+        if (read_container_info(container_name, &info) != 0) {
+            overall_result = -1;
+            continue;
+        }
+        if (refresh_container_status_if_needed(container_name, &info) < 0) {
+            overall_result = -1;
+            continue;
+        }
+        if (strcmp(info.status, "RUNNING") != 0) {
+            log_info("container %s is already %s", container_name, info.status);
+            continue;
+        }
+        if (signal_container_processes(container_name, SIGTERM) != 0) {
+            overall_result = -1;
+            continue;
+        }
+
+        int pid_list[1024];
+        int pid_count = container_process_count(container_name, pid_list,
+                                                sizeof(pid_list) / sizeof(pid_list[0]));
+        for (int poll = 0; pid_count > 0 && poll < args->time * 10; poll++) {
+            (void)nanosleep(&poll_interval, NULL);
+            pid_count = container_process_count(container_name, pid_list,
+                                                sizeof(pid_list) / sizeof(pid_list[0]));
+        }
+        if (pid_count > 0) {
+            if (signal_container_processes(container_name, SIGKILL) != 0) {
+                overall_result = -1;
+                continue;
+            }
+            for (int poll = 0; pid_count > 0 && poll < 20; poll++) {
+                (void)nanosleep(&poll_interval, NULL);
+                pid_count = container_process_count(container_name, pid_list,
+                                                    sizeof(pid_list) / sizeof(pid_list[0]));
             }
         }
-    }
-
-    for (int i = 0; i < args->container_cnt; i++) {
-        char *container_name = args->container_names[i];
-        //将容器状态标记为stoped
-        if (update_container_status(container_name, CONTAINER_STOPPED) == -1) {
-            log_error("failed to set containter %s status as STOPPED", container_name);
+        if (pid_count != 0) {
+            log_error("container %s still has processes; status not changed",
+                      container_name);
+            overall_result = -1;
+            continue;
+        }
+        if (update_container_status(container_name, CONTAINER_STOPPED) != 0) {
+            overall_result = -1;
         }
     }
-    return 0;       
+    return overall_result;
 }
 
 
 int docker_rm(struct docker_rm_arguments *args) {
+    int overall_result = 0;
     for (int i = 0; i < args->container_cnt; i++) {
         char *container_name = args->containers[i];
         if (!container_exists(container_name)) {
-            log_error("container %s not exists, ignore it", container_name);
+            log_info("container %s is already absent", container_name);
             continue;
         }
 
         struct container_info info;
         if (read_container_info(container_name, &info) == -1) {
-            log_error("failed to load container's status for %s", container_name);
-            return -1;
+            log_error("refusing to remove %s because its metadata is missing or corrupt",
+                      container_name);
+            overall_result = -1;
+            continue;
+        }
+        if (refresh_container_status_if_needed(container_name, &info) < 0) {
+            overall_result = -1;
+            continue;
         }
 
         if (strcmp(info.status, "RUNNING") == 0) {
             log_warn("container %s running, ignore remove", container_name);
+            overall_result = -1;
             continue;
         }
 
-        clean_container_runtime(container_name);
-        log_info("finish clean runtime dir for container: %s", container_name);
+        if (clean_container_runtime(container_name, &info) != 0) {
+            log_error("container %s cleanup is incomplete; metadata kept for retry",
+                      container_name);
+            overall_result = -1;
+        } else {
+            log_info("finished cleanup for container: %s", container_name);
+        }
     }
-    return 0;
+    return overall_result;
 }
 
 int docker_inspect(struct docker_inspect_arguments *args) {
@@ -722,6 +1025,18 @@ int docker_inspect(struct docker_inspect_arguments *args) {
     printf("Created: %s\n", info.created);
     printf("IP: %s\n", strlen(info.ip_addr) > 0 ? info.ip_addr : "none");
     printf("CgroupPath: %s\n", cgroup_path);
+    printf("CgroupAvailable: %s\n", path_exist(cgroup_path) ? "yes" : "no");
+
+    char container_dir[PATH_MAX] = {0};
+    char rootfs_path[PATH_MAX] = {0};
+    char status_path[PATH_MAX] = {0};
+    if (build_container_runtime_paths(args->container_name, container_dir,
+                                      sizeof(container_dir), rootfs_path,
+                                      sizeof(rootfs_path), status_path,
+                                      sizeof(status_path)) == 0) {
+        printf("RootfsPath: %s\n", rootfs_path);
+        printf("RootfsAvailable: %s\n", path_exist(rootfs_path) ? "yes" : "no");
+    }
 
     if (info.volume_cnt > 0) {
         printf("Volumes:\n");
@@ -819,6 +1134,10 @@ int docker_stats(struct docker_stats_arguments *args) {
     char cgroup_path[1024] = {0};
     if (get_container_cgroup_path(args->container_name, cgroup_path, sizeof(cgroup_path)) != 0) {
         return -1;
+    }
+    if (!path_exist(cgroup_path)) {
+        fprintf(stderr, "warning: cgroup is unavailable for %s; metrics are N/A\n",
+                args->container_name);
     }
 
     char cpu_usec[128] = {0};

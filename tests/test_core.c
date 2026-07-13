@@ -92,6 +92,11 @@ static void test_safe_paths(void)
                             sizeof(second_veth)) == 0);
     CHECK(strlen(first_veth) <= 15U);
     CHECK(strcmp(first_veth, second_veth) != 0);
+    CHECK(td_archive_entry_is_safe("usr/bin/tool") == 1);
+    CHECK(td_archive_entry_is_safe("./usr/bin/tool") == 1);
+    CHECK(td_archive_entry_is_safe("../host") == 0);
+    CHECK(td_archive_entry_is_safe("usr/../../host") == 0);
+    CHECK(td_archive_entry_is_safe("/absolute/path") == 0);
 }
 
 static void test_cidr_and_cgroup_parsing(void)
@@ -125,6 +130,17 @@ static void test_cidr_and_cgroup_parsing(void)
     CHECK(strcmp(formatted, "max") == 0);
     CHECK(td_format_bytes("12oops", formatted, sizeof(formatted),
                           error, sizeof(error)) == -1);
+
+    int pids[2] = {0};
+    size_t pid_count = 0U;
+    CHECK(td_parse_cgroup_pid_list("12\n34\n", pids, 2U, &pid_count,
+                                   error, sizeof(error)) == 0);
+    CHECK(pid_count == 2U);
+    CHECK(pids[0] == 12 && pids[1] == 34);
+    CHECK(td_parse_cgroup_pid_list("12x\n", pids, 2U, &pid_count,
+                                   error, sizeof(error)) == -1);
+    CHECK(td_parse_cgroup_pid_list("12\n34\n", pids, 1U, &pid_count,
+                                   error, sizeof(error)) == -1);
 }
 
 static void test_proc_stat_parser(void)
@@ -175,6 +191,35 @@ static void test_status_codec(void)
     CHECK(td_parse_container_info(missing_status, strlen(missing_status),
                                   "demo", &info, error, sizeof(error)) == -1);
     CHECK(strstr(error, "missing") != NULL);
+
+    FILE *stream = tmpfile();
+    CHECK(stream != NULL);
+    if (stream != NULL) {
+        char serialized[4096] = {0};
+        CHECK(td_parse_container_info(valid, strlen(valid), "demo", &info,
+                                      error, sizeof(error)) == 0);
+        CHECK(td_write_container_info(stream, &info, error, sizeof(error)) == 0);
+        CHECK(fflush(stream) == 0);
+        CHECK(fseek(stream, 0L, SEEK_SET) == 0);
+        size_t count = fread(serialized, 1, sizeof(serialized), stream);
+        struct container_info round_trip;
+        CHECK(td_parse_container_info(serialized, count, "demo", &round_trip,
+                                      error, sizeof(error)) == 0);
+        CHECK(round_trip.pid_start_time == info.pid_start_time);
+        CHECK(strcmp(round_trip.volumes[0], info.volumes[0]) == 0);
+        CHECK(fclose(stream) == 0);
+    }
+
+    CHECK(td_parse_container_info(valid, strlen(valid), "demo", &info,
+                                  error, sizeof(error)) == 0);
+    (void)snprintf(info.command, sizeof(info.command), "bad\ncommand");
+    stream = tmpfile();
+    CHECK(stream != NULL);
+    if (stream != NULL) {
+        CHECK(td_write_container_info(stream, &info, error, sizeof(error)) == -1);
+        CHECK(strstr(error, "invalid") != NULL);
+        CHECK(fclose(stream) == 0);
+    }
 }
 
 static void test_cleanup_idempotency(void)

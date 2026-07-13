@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <sys/mount.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
@@ -13,7 +14,9 @@
 #include "cgroup.h"
 #include "container.h"
 #include "volumes.h"
+#include "workspace.h"
 #include "../core/safety.h"
+#include "../core/fs.h"
 
 
 //设置容器新的根目录
@@ -54,11 +57,13 @@ int init_and_set_new_root(const char *new_root) {
         log_error("old root path is too long");
         return -1;
     }
-    if (!path_exist(old_root)) {
-        if (make_path(old_root) == -1) {
-            log_error("failed to create old_root: %s", old_root);
-            return -1;
-        }
+    char verified_old_root[PATH_MAX] = {0};
+    if (td_ensure_directory_beneath(normalized_root, "/old_root",
+                                    verified_old_root,
+                                    sizeof(verified_old_root)) != 0 ||
+        strcmp(verified_old_root, old_root) != 0) {
+        log_error("failed to safely create old_root: %s", old_root);
+        return -1;
     }
 
     log_info("set new root as: %s, old_root save to: %s", normalized_root, old_root);
@@ -87,8 +92,16 @@ int init_and_set_new_root(const char *new_root) {
     }
 
     //检查proc目录挂载进程信息
-    if (!path_exist("/proc"))
-        make_path("/proc");
+    struct stat proc_status;
+    if (lstat("/proc", &proc_status) != 0) {
+        if (errno != ENOENT || mkdir("/proc", 0555) != 0) {
+            log_error("failed to create /proc mountpoint: %s", strerror(errno));
+            return -1;
+        }
+    } else if (!S_ISDIR(proc_status.st_mode)) {
+        log_error("refusing non-directory /proc mountpoint in rootfs");
+        return -1;
+    }
 
     if (mount("proc", "/proc", "proc", MS_NOEXEC|MS_NOSUID|MS_NODEV, NULL) == -1) {
         perror("mount proc error");
@@ -125,10 +138,33 @@ static int create_readonly_layer(const char *image, char *readonly_dir,
         return 0;
     }
 
-    if (make_path(readonly_dir) != 0) {
+    char temporary_dir[PATH_MAX] = {0};
+    int temporary_length = snprintf(temporary_dir, sizeof(temporary_dir),
+                                    "%s.tmp.%ld", readonly_dir, (long)getpid());
+    if (temporary_length < 0 ||
+        (size_t)temporary_length >= sizeof(temporary_dir)) {
         return -1;
     }
-    return extract_tar(image, readonly_dir);
+    if (remove_dir(temporary_dir) != 0 || make_path(temporary_dir) != 0) {
+        log_error("failed to prepare temporary image directory %s",
+                  temporary_dir);
+        return -1;
+    }
+    if (extract_tar(image, temporary_dir) != 0) {
+        (void)remove_dir(temporary_dir);
+        return -1;
+    }
+    if (rename(temporary_dir, readonly_dir) != 0) {
+        if (errno == EEXIST && path_exist(readonly_dir)) {
+            (void)remove_dir(temporary_dir);
+            return 0;
+        }
+        log_error("failed to publish image directory %s: %s",
+                  readonly_dir, strerror(errno));
+        (void)remove_dir(temporary_dir);
+        return -1;
+    }
+    return 0;
 }
 
 //创建读写层, 即overlayfs的upperdir
