@@ -46,7 +46,7 @@ flowchart TD
 | Namespace | UTS、PID、mount、network、IPC；`exec` 使用 namespace fd + `setns()` | user namespace、time namespace、完整 id mapping |
 | 文件系统 | 单 lowerdir OverlayFS、upper/work/mountpoint、bind volume、只读 remount、`pivot_root`、独立 `/proc` | OCI rootfs、多个镜像 layer metadata、完整 archive/symlink 恶意输入防护、只读 rootfs 策略 |
 | cgroup v2 | v2 检测、容器 cgroup 创建、`cpu.max`、`memory.max`、`cgroup.procs`、CPU/memory/pids stats | 自动启用父级 controller、`pids.max` 配置、systemd/DBus 管理、delegation、压力指标 |
-| 网络 | bridge、唯一 veth pair、容器地址/默认路由、OUTPUT/PREROUTING DNAT、MASQUERADE；网络状态严格解析、writer lock + 原子替换 | CNI、IPv6、DNS、网络 namespace 持久化、策略隔离 |
+| 网络 | bridge、唯一 veth pair、容器地址/默认路由、OUTPUT/PREROUTING DNAT、MASQUERADE；网络状态严格解析、writer lock + 原子替换；interface alias + ifindex cleanup 复核 | CNI、IPv6、DNS、网络 namespace 持久化、策略隔离 |
 | 生命周期 | run、ps、inspect、stats、top、exec、stop、rm、commit、network create/ls/rm | daemon、restart policy、checkpoint/restore、健康检查 |
 | 安全 | 名称/路径/数值/CIDR 校验、无 shell 命令构造、metadata `O_NOFOLLOW` + 原子 rename、PID start-time 校验、保守 cleanup | seccomp、LSM、capability drop、rootless、签名镜像、生产级并发与审计 |
 
@@ -199,6 +199,7 @@ TINYDOCKER_ALLOW_PRIVILEGED_DEMO=1 bash demo.sh
 
 - 运行时使用 root，代码缺少 user namespace、seccomp、capability drop 和 LSM policy；容器内 root 不是可信安全边界。
 - bridge、veth 和 iptables 都是宿主机全局资源；命令失败、进程崩溃或断电仍可能留下残余。
+- bridge/veth 删除前会核对 tinydocker 写入的 interface alias、类型和 ifindex；同名接口缺少或不匹配 ownership 标记时会拒绝删除。早期版本创建但没有 alias 的 bridge 不会被自动接管或删除，应在可丢弃 VM 中人工确认后重建环境。
 - archive 目前会拒绝绝对路径和 `..` entry，并无 shell 注入，但没有完整实现生产级 tar symlink/hardlink 恶意输入模型；只使用可信 rootfs。
 - metadata 原子更新避免半写文件，但没有跨所有命令的事务锁；并发 lifecycle 操作仍可能产生逻辑竞争。
 - PID start time 大幅降低 PID reuse 误判，但 signal 前仍存在很窄的检查/使用竞争；没有使用 pidfd 完成全程身份绑定。

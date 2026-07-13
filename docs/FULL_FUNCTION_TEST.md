@@ -14,6 +14,7 @@ Use a disposable VM with a recoverable snapshot. Do not run these tests on a wor
 - Cleanup calls tinydocker only for resources marked as owned by the current run, then removes only that unique temporary directory.
 - The scripts do not scan or bulk-delete `/sys/fs/cgroup`, `/var/run`, mountpoints, network devices or unrelated runtime state.
 - A failed cleanup is reported; the scripts do not fall back to broad `kill`, `umount` or `rm -rf` commands.
+- Runtime network cleanup verifies its interface alias/type/ifindex ownership markers and refuses same-name interfaces that do not match.
 
 ## Prerequisites
 
