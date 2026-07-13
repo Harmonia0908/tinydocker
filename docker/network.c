@@ -394,9 +394,12 @@ int release_used_ip(char *name, char *ip) {
 }
 
 
-void list_network(void) {
+int list_network(void) {
     struct network nw_buffer[100];
     int cnt = get_network_list(nw_buffer, 100);
+    if (cnt < 0) {
+        return -1;
+    }
     printf("%-10s\t%s\t%-18s\t%s\n", "NAME", "DRIVER", "CIDR", "ALLOC_IPS");
     for (int i = 0; i < cnt; i++) {
         printf("%-10s\t%s\t%-18s\t", nw_buffer[i].name, nw_buffer[i].driver, nw_buffer[i].cidr);
@@ -412,12 +415,17 @@ void list_network(void) {
         }
         printf("%s\n", ips);
     }
+    return 0;
 }
 
-void remove_docker_network(struct docker_network_rm *cmd) {
+int remove_docker_network(struct docker_network_rm *cmd) {
+    int result = 0;
     for (int i = 0; i < cmd->network_argc; i++) {
-        delte_network(cmd->network_argv[i]);
+        if (delte_network(cmd->network_argv[i]) != 0) {
+            result = -1;
+        }
     }
+    return result;
 }
 
 

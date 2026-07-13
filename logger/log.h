@@ -13,6 +13,13 @@
 #include <stdbool.h>
 #include <time.h>
 
+#if defined(__GNUC__) || defined(__clang__)
+#define LOG_PRINTF_FORMAT(format_index, first_argument) \
+  __attribute__((format(printf, format_index, first_argument)))
+#else
+#define LOG_PRINTF_FORMAT(format_index, first_argument)
+#endif
+
 #define LOG_VERSION "0.1.0"
 
 typedef struct {
@@ -44,6 +51,7 @@ void log_set_quiet(bool enable);
 int log_add_callback(log_LogFn fn, void *udata, int level);
 int log_add_fp(FILE *fp, int level);
 
-void log_log(int level, const char *file, int line, const char *fmt, ...);
+void log_log(int level, const char *file, int line, const char *fmt, ...)
+  LOG_PRINTF_FORMAT(4, 5);
 
 #endif

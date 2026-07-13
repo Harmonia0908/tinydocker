@@ -8,6 +8,7 @@
 int main(int argc, char **argv)
 {
     struct docker_cmd result = parse_docker_cmd(argc, argv);
+    int command_result = -1;
     switch (result.cmd_type)
     {
     case DOCKER_RUN:
@@ -15,37 +16,37 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
         print_docker_cmds(result);
-        docker_run(result.arguments);
+        command_result = docker_run(result.arguments);
         break;
     case DOCKER_COMMIT:
         print_docker_cmds(result);
-        docker_commit(result.arguments);
+        command_result = docker_commit(result.arguments);
         break;
     case DOCKER_PS:
         print_docker_cmds(result);
-        docker_ps(result.arguments);
+        command_result = docker_ps(result.arguments);
         break;
     case DOCKER_TOP:
         print_docker_cmds(result);
-        docker_top(result.arguments);
+        command_result = docker_top(result.arguments);
         break;
     case DOCKER_EXEC:
         print_docker_cmds(result);
-        docker_exec(result.arguments);
+        command_result = docker_exec(result.arguments);
         break;
     case DOCKER_STOP:
         print_docker_cmds(result);
-        docker_stop(result.arguments);
+        command_result = docker_stop(result.arguments);
         break;
     case DOCKER_RM:
         print_docker_cmds(result);
-        docker_rm(result.arguments);
+        command_result = docker_rm(result.arguments);
         break;
     case DOCKER_INSPECT:
-        docker_inspect(result.arguments);
+        command_result = docker_inspect(result.arguments);
         break;
     case DOCKER_STATS:
-        docker_stats(result.arguments);
+        command_result = docker_stats(result.arguments);
         break;
     case DOCKER_NETWORK_CREATE:
         if (init_runtime_dirs() != 0) {
@@ -53,19 +54,19 @@ int main(int argc, char **argv)
         }
         print_docker_cmds(result);
         struct docker_network_create *cmd = (struct docker_network_create *) result.arguments;
-        create_network(cmd->name, cmd->cider, "bridge");
+        command_result = create_network(cmd->name, cmd->cider, "bridge");
         break;
     case DOCKER_NETWORK_LIST:
-        list_network();
+        command_result = list_network();
         break;
     case DOCKER_NETWORK_RM:
         print_docker_cmds(result);
-        remove_docker_network(result.arguments);
+        command_result = remove_docker_network(result.arguments);
         break;
     default:
-        puts("not support");
-        exit(-1);
+        fputs("not supported\n", stderr);
+        return EXIT_FAILURE;
     }
 
-    return 0;
+    return command_result < 0 ? EXIT_FAILURE : command_result;
 }

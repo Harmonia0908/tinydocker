@@ -523,7 +523,8 @@ int docker_run(struct docker_run_arguments *args) {
 
     //为容器分配IP, 并将容器链接到默认的网桥
     if (connect_container(args->name, TINYDOCKER_DEFAULT_NETWORK_NAME, ip_addr) == -1) {
-        log_warn("failed to connect %s to brige %s, container_pid: %s", args->name, TINYDOCKER_DEFAULT_NETWORK_NAME, child_pid);
+        log_warn("failed to connect %s to bridge %s, container_pid: %d",
+                 args->name, TINYDOCKER_DEFAULT_NETWORK_NAME, child_pid);
         goto fail_cleanup_run;
     }
 

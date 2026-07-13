@@ -1,4 +1,4 @@
-#define _XOPEN_SOURCE 500
+#define _XOPEN_SOURCE 700
 #include <sys/stat.h>
 #include <errno.h>
 #include <sys/stat.h>
@@ -99,8 +99,17 @@ int make_path(const char *dir) {
     char tmp[256];
     char *p = NULL;
     size_t len;
+    int written;
 
-    snprintf(tmp, sizeof(tmp),"%s",dir);
+    if (dir == NULL || dir[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    written = snprintf(tmp, sizeof(tmp), "%s", dir);
+    if (written < 0 || (size_t)written >= sizeof(tmp)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
     len = strlen(tmp);
     if (tmp[len - 1] == '/')
         tmp[len - 1] = 0;
