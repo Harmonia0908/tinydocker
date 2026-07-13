@@ -27,11 +27,10 @@ fi
 [ -f /sys/fs/cgroup/cgroup.controllers ] || fail "cgroup v2 is required"
 [ -x "${TD:-./tinydocker}" ] || fail "build ./tinydocker first"
 
-RUN_ID="${TINYDOCKER_TEST_RUN_ID:-$$_$(date +%s)}"
-case "$RUN_ID" in
-    *[!A-Za-z0-9_-]*) fail "unsafe test run id: $RUN_ID" ;;
-esac
-export TINYDOCKER_TEST_RUN_ID="$RUN_ID"
+if [ -n "${TINYDOCKER_TEST_RUN_ID+x}" ]; then
+    fail "TINYDOCKER_TEST_RUN_ID is internal; unset it so the suite can generate unique resources"
+fi
+export TINYDOCKER_TEST_LAUNCHED=1
 
 case "${PRIVILEGED_SUITE:-}" in
     observability) exec bash tests/test_observability.sh ;;

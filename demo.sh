@@ -6,12 +6,8 @@ cd "$ROOT_DIR"
 
 TD="${TD:-./tinydocker}"
 IMAGE="${IMAGE:-busybox.tar.xz}"
-NAME="${NAME:-td_demo_$$}"
 RUNTIME_DIR="${RUNTIME_DIR:-/home/xanarry/tinydocker_runtime}"
-INFO_DIR="$RUNTIME_DIR/container_info"
-CONTAINER_DIR="$RUNTIME_DIR/containers/$NAME"
-CGROUP_DIR="/sys/fs/cgroup/system.slice/tinydocker-$NAME"
-CLEANUP_ENABLED=0
+CGROUP_PARENT="${CGROUP_PARENT:-/sys/fs/cgroup/system.slice}"
 
 if [ "${TINYDOCKER_ALLOW_PRIVILEGED_DEMO:-0}" != "1" ]; then
     cat >&2 <<'WARNING'
@@ -25,6 +21,12 @@ fi
 [ "$(uname -s)" = "Linux" ] || { printf '[demo] Linux is required.\n' >&2; exit 2; }
 [ "$(id -u)" -eq 0 ] || { printf '[demo] run explicitly as root; sudo is never invoked.\n' >&2; exit 2; }
 TMP_DIR="$(mktemp -d /tmp/tinydocker-demo.XXXXXX)"
+UNIQUE_ID="${TMP_DIR##*.}"
+NAME="td_demo_${UNIQUE_ID}"
+INFO_DIR="$RUNTIME_DIR/container_info"
+CONTAINER_DIR="$RUNTIME_DIR/containers/$NAME"
+CGROUP_DIR="$CGROUP_PARENT/tinydocker-$NAME"
+CONTAINER_OWNED=0
 
 step_no=0
 
@@ -65,16 +67,25 @@ run_capture() {
 }
 
 cleanup_demo_artifacts() {
+    local original_status=$?
+    local cleanup_failed=0
     set +e
-    if [ "${CLEANUP_ENABLED:-0}" != "1" ]; then
-        rm -rf "$TMP_DIR"
-        set -e
-        return
+    if [ "${CONTAINER_OWNED:-0}" = "1" ]; then
+        "$TD" stop -t 1 "$NAME" >/dev/null 2>&1 || true
+        if ! "$TD" rm "$NAME" >/dev/null 2>&1; then
+            printf '[demo] cleanup failed for owned container: %s\n' "$NAME" >&2
+            cleanup_failed=1
+        fi
     fi
-    "$TD" stop -t 1 "$NAME" >/dev/null 2>&1
-    "$TD" rm "$NAME" >/dev/null 2>&1
-    rm -rf "$TMP_DIR"
-    set -e
+    case "$TMP_DIR" in
+        /tmp/tinydocker-demo.??????) rm -rf -- "$TMP_DIR" ;;
+        *) printf '[demo] refusing unexpected temp path: %s\n' "$TMP_DIR" >&2; cleanup_failed=1 ;;
+    esac
+    if [ "$cleanup_failed" -ne 0 ] && [ "$original_status" -eq 0 ]; then
+        original_status=1
+    fi
+    trap - EXIT
+    exit "$original_status"
 }
 trap cleanup_demo_artifacts EXIT
 
@@ -106,13 +117,15 @@ preflight() {
     fi
     info "image/rootfs: $IMAGE"
 
-    CLEANUP_ENABLED=1
 }
 
-pre_cleanup() {
-    step "Cleanup: remove stale demo leftovers before start"
-    cleanup_demo_artifacts
-    mkdir -p "$TMP_DIR"
+verify_resource_ownership() {
+    step "Ownership: verify generated resources are absent"
+    if [ -e "$INFO_DIR/$NAME" ] || [ -e "$CONTAINER_DIR" ] ||
+       [ -e "$CGROUP_DIR" ] || "$TD" inspect "$NAME" >/dev/null 2>&1; then
+        fail "generated demo name already exists: $NAME" \
+             "do not remove it automatically; rerun to generate a different name"
+    fi
     info "demo container name: $NAME"
 }
 
@@ -124,6 +137,7 @@ build_binary() {
 
 run_container() {
     step "Run: start a busybox/alpine container"
+    CONTAINER_OWNED=1
     run_capture "$TMP_DIR/run.out" "$TD" run -d \
         -n "$NAME" \
         -c 20000 \
@@ -144,10 +158,11 @@ stats_container() {
 
 stop_and_remove_container() {
     step "Stop: terminate the container"
-    run_capture "$TMP_DIR/stop.out" "$TD" stop -t 1 "$NAME" || true
+    run_capture "$TMP_DIR/stop.out" "$TD" stop -t 1 "$NAME"
 
     step "Remove: remove container runtime artifacts"
-    run_capture "$TMP_DIR/rm.out" "$TD" rm "$NAME" || true
+    run_capture "$TMP_DIR/rm.out" "$TD" rm "$NAME"
+    CONTAINER_OWNED=0
 }
 
 verify_cleanup() {
@@ -177,8 +192,8 @@ verify_cleanup() {
 
 main() {
     preflight
-    pre_cleanup
     build_binary
+    verify_resource_ownership
     run_container
     inspect_container
     stats_container
