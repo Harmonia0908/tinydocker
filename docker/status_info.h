@@ -5,6 +5,7 @@
 #include <time.h>
 #include "../core/container_state.h"
 
+struct docker_run_arguments;
 
 int create_container_info(struct docker_run_arguments *args, int pid,
                           enum container_status status, char *ip_addr,

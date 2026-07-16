@@ -22,11 +22,48 @@
 #include "../core/cgroup_parse.h"
 #include "../core/safety.h"
 #include "../core/process.h"
+#include "../runtime/container.h"
 
 
 extern char **environ;
 static int pipe_fd[2];
 static volatile sig_atomic_t foreground_child_pid = -1;
+
+static const char *container_stage_name(enum container_stage stage) {
+    switch (stage) {
+        case CONTAINER_STAGE_CONFIG_PREPARE:
+            return "config.prepare";
+        case CONTAINER_STAGE_EXISTENCE_CHECK:
+            return "container.check";
+        case CONTAINER_STAGE_FILESYSTEM_PREPARE:
+            return "filesystem.prepare";
+        case CONTAINER_STAGE_VOLUME_MOUNT:
+            return "filesystem.volumes";
+        case CONTAINER_STAGE_CGROUP_PREPARE:
+            return "cgroup.prepare";
+        case CONTAINER_STAGE_SYNC_PIPE_CREATE:
+            return "process.pipe";
+        case CONTAINER_STAGE_PROCESS_CREATE:
+            return "process.clone";
+        case CONTAINER_STAGE_CGROUP_APPLY:
+            return "cgroup.apply";
+        case CONTAINER_STAGE_NETWORK_PREPARE:
+            return "network.prepare";
+        case CONTAINER_STAGE_PORT_MAPPING:
+            return "network.ports";
+        case CONTAINER_STAGE_METADATA_WRITE:
+            return "state.write";
+        case CONTAINER_STAGE_CHILD_RELEASE:
+            return "process.release";
+        case CONTAINER_STAGE_PROCESS_WAIT:
+            return "process.wait";
+        case CONTAINER_STAGE_CLEANUP:
+            return "cleanup";
+        case CONTAINER_STAGE_COMPLETE:
+            return "complete";
+    }
+    return "unknown";
+}
 
 static void forward_signal_to_container(int signal_number) {
     pid_t child = (pid_t)foreground_child_pid;
@@ -204,7 +241,10 @@ static int clean_container_runtime(char *container_name,
     return cleanup_failed == 0 ? 0 : -1;
 }
 
-static void cleanup_run_failure(struct docker_run_arguments *args, char *mountpoint, char *ip_addr, pid_t child_pid, int pipe_created) {
+static void cleanup_run_failure(struct docker_run_arguments *args,
+                                struct container_runtime_state *state,
+                                char *mountpoint, char *ip_addr,
+                                pid_t child_pid, int pipe_created) {
     int mount_cleanup_failed = 0;
     if (child_pid > 0) {
         pid_t waited;
@@ -267,7 +307,9 @@ static void cleanup_run_failure(struct docker_run_arguments *args, char *mountpo
         log_warn("failed to remove container workspace: %s", container_dir);
     }
 
-    if (remove_cgroup(args->name) != 0) {
+    if (state != NULL && cgroup_cleanup(&state->cgroup) != 0) {
+        log_warn("container cleanup failed: stage=cleanup.cgroup container=%s",
+                 args->name);
         log_warn("failed to remove cgroup: %s", args->name);
     }
 
@@ -462,19 +504,46 @@ static int child_fn(void *args) {
 }
 
 int docker_run(struct docker_run_arguments *args) {
-    int ret = 0;
     int pipe_created = 0;
     pid_t child_pid = -1;
     char ip_addr[20] = {0};
     char *mountpoint = NULL;
+    struct container_config config = {
+        .name = args->name,
+        .image = args->image,
+        .interactive = args->interactive,
+        .detach = args->detach,
+        .cgroup = {
+            .cpu = args->cpu,
+            .memory = args->memory,
+            .cpuset = NULL
+        },
+        .volume_count = args->volume_cnt,
+        .volumes = args->volumes,
+        .environment_count = args->env_cnt,
+        .environment = args->env,
+        .command_argc = args->container_argc,
+        .command_argv = args->container_argv,
+        .port_mapping_count = args->port_mapping_cnt,
+        .port_mappings = args->port_mapping
+    };
+    struct container_runtime_state state = {
+        .stage = CONTAINER_STAGE_CONFIG_PREPARE
+    };
 
+    state.stage = CONTAINER_STAGE_EXISTENCE_CHECK;
     if (container_exists(args->name)) {
         log_error("container %s has exists", args->name);
+        log_error("container startup failed: stage=%s container=%s",
+                  container_stage_name(state.stage), args->name);
         return -1;
     }
+    state.stage = CONTAINER_STAGE_FILESYSTEM_PREPARE;
     mountpoint = (char *) malloc(PATH_MAX);
     if (mountpoint == NULL) {
         log_error("failed to allocate mountpoint");
+        log_error("container startup failed: stage=%s container=%s",
+                  container_stage_name(state.stage), args->name);
         return -1;
     }
     mountpoint[0] = '\0';
@@ -485,29 +554,25 @@ int docker_run(struct docker_run_arguments *args) {
     log_info("create overlay filesystem mountpoint: %s", mountpoint);
     args->mountpoint = mountpoint;
 
+    state.stage = CONTAINER_STAGE_VOLUME_MOUNT;
     if (mount_volumes(mountpoint, args->volume_cnt, args->volumes) == -1) {
         goto fail_cleanup_run;
     }
 
-    ret = init_cgroup(args->name); //创建一个test容器
-    if (ret != 0) {
-        perror("failed to init cgroup");
-        goto fail_cleanup_run;
-    }
-
-    // 注意这里cpu和mem如果设置的太小, 容器可能起不来, cpu最小要求1000, 也就是1%, mem测试能起来的最小值是204800
-    if (set_cgroup_limits(args->name, args->cpu, args->memory, NULL) != 0) {
-        log_error("failed to set_cgroup_limits for %s", args->name);
+    state.stage = CONTAINER_STAGE_CGROUP_PREPARE;
+    if (cgroup_prepare(config.name, &config.cgroup, &state.cgroup) != 0) {
         goto fail_cleanup_run;
     }
     log_info("set_cgroup_limits cpu=%d, mem=%d", args->cpu, args->memory);
 
+    state.stage = CONTAINER_STAGE_SYNC_PIPE_CREATE;
     if (pipe(pipe_fd) == -1) {
         goto fail_cleanup_run;
     }
     pipe_created = 1;
 
     // 这里不要加CLONE_NEWUSER, 否则会导致pivot_root权限不足, 
+    state.stage = CONTAINER_STAGE_PROCESS_CREATE;
     child_pid = clone(child_fn, child_stack+(8 * 1024 * 1024), CLONE_NEWUTS | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWIPC | SIGCHLD, args);
     if (child_pid == -1) {
         perror("clone subprocess error");
@@ -516,12 +581,14 @@ int docker_run(struct docker_run_arguments *args) {
     log_info("docker process pid=%d", child_pid);
 
     //应用cgroup限制
-    if (apply_cgroup_limit_to_pid(args->name, child_pid) != 0) {
+    state.stage = CONTAINER_STAGE_CGROUP_APPLY;
+    if (cgroup_apply(&state.cgroup, child_pid) != 0) {
         log_error("failed apply_cgroup_limit_to_pid, container: %s, pid:%d", args->name, child_pid);
         goto fail_cleanup_run;
     }
 
     //为容器分配IP, 并将容器链接到默认的网桥
+    state.stage = CONTAINER_STAGE_NETWORK_PREPARE;
     if (connect_container(args->name, TINYDOCKER_DEFAULT_NETWORK_NAME, ip_addr) == -1) {
         log_warn("failed to connect %s to bridge %s, container_pid: %d",
                  args->name, TINYDOCKER_DEFAULT_NETWORK_NAME, child_pid);
@@ -529,6 +596,7 @@ int docker_run(struct docker_run_arguments *args) {
     }
 
     //设置端口映射
+    state.stage = CONTAINER_STAGE_PORT_MAPPING;
     if (set_container_port_map(ip_addr, args->port_mapping_cnt,
                                args->port_mapping) != 0) {
         log_error("failed to configure port mappings for %s", args->name);
@@ -536,6 +604,7 @@ int docker_run(struct docker_run_arguments *args) {
     }
 
     //记录容器信息
+    state.stage = CONTAINER_STAGE_METADATA_WRITE;
     time_t start_time = time(NULL);
     struct container_info info;
     if (create_container_info(args, child_pid, CONTAINER_RUNNING, ip_addr, start_time, &info) != 0) {
@@ -548,6 +617,7 @@ int docker_run(struct docker_run_arguments *args) {
     }
 
     //发送任意消息解除子进程的阻塞
+    state.stage = CONTAINER_STAGE_CHILD_RELEASE;
     close(pipe_fd[0]);  //这里的关闭一定要放在创建子进程后面, 如果放在创建子进程前面, 由于继承关系,直接给子进程的读关闭了
     char start_message = '1';
     ssize_t write_count;
@@ -564,12 +634,14 @@ int docker_run(struct docker_run_arguments *args) {
 
     // 如果配置了it任一参数, 等待容器退出
     if (args->detach == 1) {
+        state.stage = CONTAINER_STAGE_COMPLETE;
         log_info("leave container process running in background");
         free(mountpoint);
         return 0;
     }
 
     int exit_status = 0;
+    state.stage = CONTAINER_STAGE_PROCESS_WAIT;
     const int forwarded_signals[] = {SIGINT, SIGTERM, SIGHUP};
     struct sigaction previous_actions[3];
     int action_installed[3] = {0};
@@ -600,6 +672,8 @@ int docker_run(struct docker_run_arguments *args) {
     if (waited < 0) {
         log_error("waitpid failed for container %s: %s",
                   args->name, strerror(errno));
+        log_error("container startup failed: stage=%s container=%s",
+                  container_stage_name(state.stage), args->name);
         free(mountpoint);
         return -1;
     }
@@ -612,6 +686,7 @@ int docker_run(struct docker_run_arguments *args) {
     if (update_container_status(args->name, CONTAINER_EXITED) != 0) {
         log_warn("failed to persist EXITED status for %s", args->name);
     }
+    state.stage = CONTAINER_STAGE_COMPLETE;
     free(mountpoint);
     if (WIFEXITED(exit_status)) {
         return WEXITSTATUS(exit_status);
@@ -619,7 +694,11 @@ int docker_run(struct docker_run_arguments *args) {
     return 128 + WTERMSIG(exit_status);
 
 fail_cleanup_run:
-    cleanup_run_failure(args, mountpoint, ip_addr, child_pid, pipe_created);
+    log_error("container startup failed: stage=%s container=%s",
+              container_stage_name(state.stage), args->name);
+    state.stage = CONTAINER_STAGE_CLEANUP;
+    cleanup_run_failure(args, &state, mountpoint, ip_addr, child_pid,
+                        pipe_created);
     free(mountpoint);
     return -1;
 }

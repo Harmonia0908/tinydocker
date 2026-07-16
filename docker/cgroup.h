@@ -1,8 +1,27 @@
 #ifndef CGROUP_H
 #define CGROUP_H
 
+#include <limits.h>
 #include <stddef.h>
 #include <sys/types.h>
+
+struct cgroup_config {
+    int cpu;
+    int memory;
+    const char *cpuset;
+};
+
+struct cgroup_state {
+    char path[PATH_MAX];
+    int created;
+};
+
+/* state must be zero-initialized and cleaned before it is prepared again. */
+int cgroup_prepare(const char *container_name,
+                   const struct cgroup_config *config,
+                   struct cgroup_state *state);
+int cgroup_apply(struct cgroup_state *state, pid_t pid);
+int cgroup_cleanup(struct cgroup_state *state);
 
 int init_cgroup(const char *container_name);
 int remove_cgroup(const char *container_name);

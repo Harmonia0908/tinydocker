@@ -1,11 +1,14 @@
 tinydocker
 a.out
 *.o
+*.d
 *.log
 *.tmp
 .DS_Store
 results/
-runtime/
+runtime/*
+!runtime/*.c
+!runtime/*.h
 build/
 *_test_output.txt
 docs/project_interview_notes.md

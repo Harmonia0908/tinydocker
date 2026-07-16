@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 TD="${TD:-./tinydocker}"
+BUILT_TD="./tinydocker"
 IMAGE="${IMAGE:-busybox.tar.xz}"
 
 if [ "${TINYDOCKER_ALLOW_PRIVILEGED_TESTS:-0}" != "1" ]; then
@@ -21,6 +22,8 @@ C1="tdt_${UNIQUE_ID}_run"
 C2="tdt_${UNIQUE_ID}_obs"
 C3="tdt_${UNIQUE_ID}_port"
 C4="tdt_${UNIQUE_ID}_commit"
+C5="tdt_${UNIQUE_ID}_cgprep"
+C6="tdt_${UNIQUE_ID}_cgapply"
 NET="tdn${UNIQUE_ID}"
 HOST_RW="$TMP_ROOT/host-rw"
 HOST_RO="$TMP_ROOT/host-ro"
@@ -30,6 +33,8 @@ C1_OWNED=0
 C2_OWNED=0
 C3_OWNED=0
 C4_OWNED=0
+C5_OWNED=0
+C6_OWNED=0
 NET_OWNED=0
 
 log() {
@@ -52,11 +57,22 @@ cleanup() {
     set +e
     log "cleanup"
     for owned_name in \
-        "$C1_OWNED:$C1" "$C2_OWNED:$C2" "$C3_OWNED:$C3" "$C4_OWNED:$C4"; do
+        "$C1_OWNED:$C1" "$C2_OWNED:$C2" "$C3_OWNED:$C3" \
+        "$C4_OWNED:$C4"; do
         if [ "${owned_name%%:*}" = "1" ]; then
             local name="${owned_name#*:}"
             "$TD" stop -t 1 "$name" >/dev/null 2>&1 || true
             if ! "$TD" rm "$name" >/dev/null 2>&1; then
+                printf '[test-full] cleanup failed for owned container: %s\n' "$name" >&2
+                cleanup_failed=1
+            fi
+        fi
+    done
+    for owned_name in "$C5_OWNED:$C5" "$C6_OWNED:$C6"; do
+        if [ "${owned_name%%:*}" = "1" ]; then
+            local name="${owned_name#*:}"
+            "$BUILT_TD" stop -t 1 "$name" >/dev/null 2>&1 || true
+            if ! "$BUILT_TD" rm "$name" >/dev/null 2>&1; then
                 printf '[test-full] cleanup failed for owned container: %s\n' "$name" >&2
                 cleanup_failed=1
             fi
@@ -92,16 +108,73 @@ assert_file_contains() {
     fi
 }
 
+assert_path_absent() {
+    local path="$1"
+    local message="$2"
+    [ ! -e "$path" ] || fail "$message: $path"
+}
+
+run_expect_failure() {
+    local output_file="$1"
+    shift
+    log "run expecting failure: $*"
+    if "$@" >"$output_file" 2>&1; then
+        cat "$output_file" >&2
+        fail "command unexpectedly succeeded: $*"
+    fi
+}
+
 [ -f "$IMAGE" ] || fail "image not found: $IMAGE"
 
 mkdir -p "$HOST_RW" "$HOST_RO"
 printf 'readonly-data\n' >"$HOST_RO/input.txt"
 
+ACTIVE_RUNTIME_DIR="${RUNTIME_DIR:-/home/xanarry/tinydocker_runtime}"
+NORMAL_CGROUP_PARENT="${CGROUP_PARENT:-/sys/fs/cgroup/system.slice}"
+MISSING_CGROUP_PARENT="$TMP_ROOT/missing-cgroup-parent"
+FAKE_CGROUP_PARENT="$TMP_ROOT/fake-cgroup-parent"
+
+log "check cgroup prepare failure rollback"
 run make clean
-run make
+run make RUNTIME_DIR="$ACTIVE_RUNTIME_DIR" CGROUP_PARENT="$MISSING_CGROUP_PARENT"
+C5_OWNED=1
+run_expect_failure "$TMP_ROOT/cgroup-prepare-failure.out" \
+    "$BUILT_TD" run -d -n "$C5" "$IMAGE" /bin/true
+assert_file_contains "$TMP_ROOT/cgroup-prepare-failure.out" \
+    "stage=cgroup.prepare" "failure log should identify cgroup prepare"
+assert_path_absent "$ACTIVE_RUNTIME_DIR/containers/$C5" \
+    "cgroup prepare failure should remove workspace"
+assert_path_absent "$ACTIVE_RUNTIME_DIR/container_info/$C5" \
+    "cgroup prepare failure should not leave metadata"
+C5_OWNED=0
+
+log "check cgroup apply failure rollback"
+mkdir -p "$FAKE_CGROUP_PARENT"
+run make clean
+run make RUNTIME_DIR="$ACTIVE_RUNTIME_DIR" CGROUP_PARENT="$FAKE_CGROUP_PARENT"
+C6_OWNED=1
+run_expect_failure "$TMP_ROOT/cgroup-apply-failure.out" \
+    "$BUILT_TD" run -d -n "$C6" "$IMAGE" /bin/true
+assert_file_contains "$TMP_ROOT/cgroup-apply-failure.out" \
+    "stage=cgroup.apply" "failure log should identify cgroup apply"
+CHILD_PID="$(sed -n 's/.*docker process pid=\([0-9][0-9]*\).*/\1/p' \
+    "$TMP_ROOT/cgroup-apply-failure.out" | tail -n 1)"
+[ -n "$CHILD_PID" ] || fail "cgroup apply failure did not report child pid"
+assert_path_absent "/proc/$CHILD_PID" \
+    "cgroup apply rollback should kill and reap the blocked child"
+assert_path_absent "$ACTIVE_RUNTIME_DIR/containers/$C6" \
+    "cgroup apply failure should remove workspace"
+assert_path_absent "$ACTIVE_RUNTIME_DIR/container_info/$C6" \
+    "cgroup apply failure should not leave metadata"
+assert_path_absent "$FAKE_CGROUP_PARENT/tinydocker-$C6" \
+    "cgroup apply failure should remove its cgroup"
+C6_OWNED=0
+
+run make clean
+run make RUNTIME_DIR="$ACTIVE_RUNTIME_DIR" CGROUP_PARENT="$NORMAL_CGROUP_PARENT"
 
 log "verify unique resources are absent: $UNIQUE_ID"
-for name in "$C1" "$C2" "$C3" "$C4"; do
+for name in "$C1" "$C2" "$C3" "$C4" "$C5" "$C6"; do
     if "$TD" inspect "$name" >/dev/null 2>&1; then
         fail "generated container name already exists: $name"
     fi

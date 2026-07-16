@@ -220,6 +220,89 @@ int set_cgroup_limits(const char *container_name, int cpu, int memory,
     return 0;
 }
 
+int cgroup_prepare(const char *container_name,
+                   const struct cgroup_config *config,
+                   struct cgroup_state *state) {
+    int saved_errno;
+
+    if (container_name == NULL || config == NULL || state == NULL) {
+        errno = EINVAL;
+        log_error("invalid cgroup lifecycle configuration");
+        return -1;
+    }
+    if (state->created != 0) {
+        errno = EBUSY;
+        log_error("refusing to prepare an already owned cgroup: %s",
+                  state->path);
+        return -1;
+    }
+    memset(state, 0, sizeof(*state));
+    if (get_container_cgroup_path(container_name, state->path,
+                                  sizeof(state->path)) != 0 ||
+        init_cgroup(container_name) != 0) {
+        perror("failed to init cgroup");
+        return -1;
+    }
+    state->created = 1;
+    if (set_cgroup_limits(container_name, config->cpu, config->memory,
+                          config->cpuset) == 0) {
+        return 0;
+    }
+
+    saved_errno = errno == 0 ? EIO : errno;
+    log_error("failed to set_cgroup_limits for %s", container_name);
+    if (cgroup_cleanup(state) != 0) {
+        log_error("failed to roll back cgroup after limit configuration error: %s",
+                  state->path);
+    }
+    errno = saved_errno;
+    return -1;
+}
+
+int cgroup_apply(struct cgroup_state *state, pid_t pid) {
+    char procs_path[PATH_MAX];
+    int written;
+
+    if (state == NULL || state->created == 0 || state->path[0] == '\0' ||
+        pid <= 0) {
+        errno = EINVAL;
+        log_error("invalid prepared cgroup state or pid");
+        return -1;
+    }
+    written = snprintf(procs_path, sizeof(procs_path), "%s/cgroup.procs",
+                       state->path);
+    if (written < 0 || (size_t)written >= sizeof(procs_path)) {
+        errno = ENAMETOOLONG;
+        log_error("cgroup.procs path is too long: %s", state->path);
+        return -1;
+    }
+    return write_pid_to_cgroup_procs((int)pid, procs_path);
+}
+
+int cgroup_cleanup(struct cgroup_state *state) {
+    if (state == NULL) {
+        errno = EINVAL;
+        log_error("invalid cgroup state for cleanup");
+        return -1;
+    }
+    if (state->created == 0) {
+        return 0;
+    }
+    if (state->path[0] == '\0') {
+        errno = EINVAL;
+        log_error("refusing to clean cgroup with an empty owned path");
+        return -1;
+    }
+    if (rmdir(state->path) != 0 && errno != ENOENT) {
+        log_error("failed to remove cgroup %s: %s", state->path,
+                  strerror(errno));
+        return -1;
+    }
+    state->created = 0;
+    state->path[0] = '\0';
+    return 0;
+}
+
 int get_container_processes_id(const char *container_name, int *pid_list,
                                size_t capacity) {
     char cgroup_procs_path[1024] = {0};

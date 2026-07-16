@@ -16,14 +16,16 @@
 flowchart TD
     CLI["CLI / cmdparser"] --> V["纯逻辑校验<br/>name · number · CIDR · volume path"]
     V --> WS["Workspace<br/>image cache · OverlayFS · bind volumes"]
-    WS --> CG["cgroup v2<br/>create · limits · cgroup.procs"]
+    WS --> CG["cgroup v2<br/>create · limits"]
     CG --> CL["clone<br/>UTS · PID · mount · network · IPC"]
-    CL --> SYNC["父子 pipe 同步"]
-    SYNC --> NET["veth · bridge · route · iptables"]
+    CL --> ROOT["child<br/>private propagation · pivot_root · /proc"]
+    ROOT --> SYNC["child waits on pipe"]
+    CL --> APPLY["parent<br/>write child PID to cgroup.procs"]
+    APPLY --> NET["veth · bridge · route · iptables"]
     NET --> META["原子 metadata 写入<br/>PID + /proc start time"]
     META --> GO["父进程授权 1 byte"]
-    GO --> ROOT["private propagation · pivot_root · /proc"]
-    ROOT --> EXEC["execve container command"]
+    GO --> SYNC
+    SYNC --> EXEC["execve container command"]
     META --> OBS["ps · inspect · stats · top · exec · stop · rm"]
 ```
 
@@ -31,11 +33,11 @@ flowchart TD
 
 1. 校验容器名、资源数值、CIDR、端口与卷目标路径。
 2. 准备镜像只读层、upperdir、workdir、OverlayFS mountpoint 和 bind volume。
-3. 创建 cgroup v2 子目录并写入 `cpu.max`、`memory.max` 和 `cgroup.procs`。
+3. 创建 cgroup v2 子目录并写入 `cpu.max` 和 `memory.max`。
 4. `clone()` 创建 UTS、PID、mount、network、IPC namespace；项目不创建 user namespace。
-5. 子进程在 pipe 上等待；父进程完成 cgroup、veth/bridge、路由、iptables 和 metadata。
-6. 父进程只写入一个明确的授权字节；EOF、短读或父进程失败都会让子进程拒绝执行用户命令。
-7. 子进程设置 private mount propagation，执行 bind mount、`pivot_root`、旧 root 卸载和 `/proc` 挂载，最后 `execve()`。
+5. 子进程设置 private mount propagation，执行 bind mount、`pivot_root`、旧 root 卸载和 `/proc` 挂载，然后在 pipe 上等待。
+6. 父进程把 child PID 写入 `cgroup.procs`，再完成 veth/bridge、路由、iptables 和 metadata。
+7. 父进程只写入一个明确的授权字节；EOF、短读或父进程失败都会让子进程拒绝执行用户命令，授权成功后才 `execve()`。
 
 前台 `run` 会转发 `SIGINT`、`SIGTERM`、`SIGHUP` 并可靠 `waitpid()`；`exec` 使用 namespace worker，再 fork 真正的命令进程，避免把宿主 CLI 自身移入容器 cgroup。
 
@@ -72,7 +74,12 @@ metadata 同时记录 PID 和 `/proc/<pid>/stat` 的 start time：
 
 cgroup 已删除或指标文件不可读时会明确警告并输出 `N/A`，不会假装指标有效。
 
-cleanup 遵循“先停止进程，再卸载 volume/rootfs，再清网络，再删 workspace/cgroup，最后删 metadata”的思路。重复删除缺失文件/目录按成功处理；如果 mount 可能仍然存在，代码会拒绝递归删除 workspace，并保留 metadata 供再次检查，而不会跨过失败继续做危险清理。
+正常 `rm` 只接受非运行容器，依次卸载 volume/rootfs、清理端口规则/veth/IP、删除
+workspace 和 cgroup，最后在此前步骤全部成功时删除 metadata。启动失败走另一条回滚路径：先
+kill/reap child 并关闭 pipe，再清网络、卸载文件系统、删除 workspace/cgroup 和可能已写入的
+metadata。重复删除缺失文件/目录按成功处理；如果 mount 可能仍然存在，代码会拒绝递归删除
+workspace，并保留可能已经写入的 partial metadata；只有 mount 清理成功时启动回滚才删除该
+metadata，而不会跨过失败继续做危险清理。
 
 ## 仓库结构
 
@@ -81,6 +88,8 @@ cmdparser/   CLI 与参数结构
 core/        可跨平台测试的校验、状态 codec、cgroup parser、fs/process helper
 docker/      lifecycle、namespace、cgroup、workspace、volume、network、observability
 logger/      轻量日志实现
+runtime/     容器生命周期配置、阶段与资源所有权状态
+scripts/     本地构建与非特权测试的薄封装
 tests/       非特权 C 测试、显式 opt-in 的特权集成测试
 .github/     默认只执行安全测试的 CI
 ```
@@ -107,6 +116,23 @@ make RUNTIME_DIR=/var/lib/tinydocker \
      CGROUP_PARENT=/sys/fs/cgroup/tinydocker.slice
 ```
 
+不带目标的 `make` 保持原有兼容行为，使用 `-O2 -g` 生成仓库根目录下的
+`tinydocker`。需要明确区分开发和发布配置时，可以使用：
+
+```bash
+make debug    # -O0 -g3，输出 build/debug/tinydocker
+make release  # -O2 -DNDEBUG，输出 build/release/tinydocker
+```
+
+两个配置使用独立的对象目录，切换配置不会复用另一配置的 `.o` 文件。也可以通过薄脚本调用
+相同的 Make 目标，并继续传递 `CC`、`RUNTIME_DIR`、`CGROUP_PARENT` 等 Make 参数：
+
+```bash
+scripts/build.sh
+scripts/build.sh debug CC=clang
+scripts/build.sh release RUNTIME_DIR=/var/lib/tinydocker
+```
+
 使用自定义 cgroup parent 前，必须由管理员创建并正确 delegation；tinydocker 不会创建未知的宿主机父层级，也不会自动修改 `cgroup.subtree_control`。
 
 macOS 不能构建运行时二进制，因为没有 Linux `clone/setns/mount/pivot_root` 与 cgroup API。`make` 会给出明确错误，但纯逻辑测试仍可运行。
@@ -120,6 +146,7 @@ make test          # 非特权行为测试
 make static-check  # macOS: core；Linux: 全部源码严格 -Werror 检查
 make sanitize      # core tests + ASan + UBSan
 make check         # 依次执行以上三项
+scripts/test.sh    # make check 的薄封装
 ```
 
 当前非特权覆盖包括：
@@ -139,6 +166,26 @@ make check         # 依次执行以上三项
 - veth 名长度和碰撞规避
 
 GitHub Actions 默认只运行 Linux build、非特权测试、严格静态编译与 sanitizer；不会运行特权集成测试。
+
+## 代码格式
+
+仓库根目录的 `.clang-format` 用于新增或正在修改的 C 源码。历史代码尚未整体格式化，因此格式检查
+要求显式指定文件，避免产生大范围无行为价值的 diff：
+
+```bash
+make format-check FILES="runtime/container.h"
+make format FILES="path/to/changed.c path/to/changed.h"
+```
+
+macOS Command Line Tools 中的 `clang-format` 如果不在 `PATH`，可以显式传入：
+
+```bash
+make CLANG_FORMAT="$(xcrun --find clang-format)" \
+     format-check FILES="runtime/container.h"
+```
+
+普通构建启用 `-Wall -Wextra -Wpedantic` 及少量现有附加警告，但不会使用 `-Werror`；
+`make static-check` 和测试编译仍使用 `-Werror`，用于阻止新警告进入受检查范围。
 
 ## 特权集成测试
 
